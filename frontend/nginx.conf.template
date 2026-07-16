@@ -8,6 +8,22 @@ server {
     root /usr/share/nginx/html;
     index index.html;
 
+    # Vite fingerprints asset filenames, so these can be cached hard — the name
+    # changes whenever the content does.
+    location /assets/ {
+        expires 1y;
+        add_header Cache-Control "public, immutable";
+    }
+
+    # index.html must NEVER be cached. It names the hashed bundles, so a stale
+    # copy pins the browser to a build that no longer exists — and because the
+    # browser then serves it from its own cache, it stops asking the server at
+    # all. A rebuilt frontend never reaches the user, reloads included.
+    location = /index.html {
+        add_header Cache-Control "no-store, no-cache, must-revalidate";
+        expires -1;
+    }
+
     # SPA routing
     location / {
         try_files $uri $uri/ /index.html;

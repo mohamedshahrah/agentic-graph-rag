@@ -6,6 +6,8 @@ Interactive testing UI is auto-generated at /docs (Swagger) and /redoc.
 
 from __future__ import annotations
 
+import time
+import uuid
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
@@ -28,6 +30,53 @@ log = get_logger(__name__)
 def _rate_key(request: Request) -> str:
     # Rate-limit per user, falling back to client IP for unauthenticated calls.
     return request.headers.get("X-User-Id") or get_remote_address(request)
+
+
+# Health/readiness polls every few seconds and would bury everything else.
+_QUIET_PATHS = {"/health", "/ready"}
+
+
+async def _log_requests(request: Request, call_next):
+    """One line in, one line out, per request.
+
+    Without this, "I sent a message and nothing happened" is unanswerable from
+    the container: uvicorn only logs a request once it *completes*, so anything
+    still running — or a request that never arrived — is invisible. The `started`
+    line proves the request reached the API at all, which is the first fork in
+    the diagnosis.
+    """
+    if request.url.path in _QUIET_PATHS:
+        return await call_next(request)
+
+    rid = uuid.uuid4().hex[:8]
+    started = time.perf_counter()
+    log.info(
+        "request_started",
+        rid=rid,
+        method=request.method,
+        path=request.url.path,
+        user=request.headers.get("X-User-Id", "-"),
+    )
+    try:
+        response = await call_next(request)
+    except Exception as exc:
+        log.exception(
+            "request_failed",
+            rid=rid,
+            path=request.url.path,
+            kind=type(exc).__name__,
+            error=str(exc) or type(exc).__name__,
+            seconds=round(time.perf_counter() - started, 2),
+        )
+        raise
+    log.info(
+        "request_done",
+        rid=rid,
+        path=request.url.path,
+        status=response.status_code,
+        seconds=round(time.perf_counter() - started, 2),
+    )
+    return response
 
 
 @asynccontextmanager
@@ -95,6 +144,7 @@ def create_app(container: Container | None = None) -> FastAPI:
     )
     app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
     app.add_middleware(SlowAPIMiddleware)
+    app.middleware("http")(_log_requests)
 
     app.add_middleware(
         CORSMiddleware,

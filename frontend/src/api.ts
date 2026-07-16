@@ -43,6 +43,13 @@ function headers(extra: Record<string, string> = {}): Record<string, string> {
   return h;
 }
 
+// The agent can be silent for a minute while it retrieves, so we can't time out
+// on "no tokens yet". The server pings every ~15s, so silence past this means the
+// connection is actually dead. Without a bound, a dropped connection leaves
+// `reader.read()` awaiting forever — the caller never settles and the UI wedges
+// with its send button disabled, unrecoverable without a reload.
+const IDLE_TIMEOUT_MS = 60_000;
+
 export async function streamQuery(
   question: string,
   style: string,
@@ -50,38 +57,66 @@ export async function streamQuery(
   onToken: (t: string) => void,
   onSources: (s: Source[]) => void,
 ): Promise<void> {
-  const res = await fetch(`${API}/query`, {
-    method: "POST",
-    headers: headers({ "Content-Type": "application/json" }),
-    body: JSON.stringify({ question, style, thread_id: threadId, stream: true }),
-  });
-  if (!res.body) throw new Error("No response stream");
+  const control = new AbortController();
+  let idle: ReturnType<typeof setTimeout> | undefined;
+  const resetIdle = () => {
+    clearTimeout(idle);
+    idle = setTimeout(() => control.abort(), IDLE_TIMEOUT_MS);
+  };
+  resetIdle();
 
-  const reader = res.body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = "";
+  try {
+    const res = await fetch(`${API}/query`, {
+      method: "POST",
+      headers: headers({ "Content-Type": "application/json" }),
+      body: JSON.stringify({ question, style, thread_id: threadId, stream: true }),
+      signal: control.signal,
+    });
+    // A proxy error (502/504) still has a body, which would parse as zero events
+    // and finish silently — no tokens, no error, no explanation.
+    if (!res.ok) throw new Error(`Server returned ${res.status} ${res.statusText}`);
+    if (!res.body) throw new Error("No response stream");
 
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
 
-    const events = buffer.split("\n\n");
-    buffer = events.pop() ?? "";
-    for (const raw of events) {
-      const { event, data } = parseEvent(raw);
-      if (event === "token") onToken(data);
-      else if (event === "sources") onSources(JSON.parse(data) as Source[]);
-      else if (event === "error") throw new Error(data);
+    while (true) {
+      const { done, value } = await reader.read();
+      resetIdle();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+
+      // SSE frames are separated by a blank line, and the spec allows CRLF, LF
+      // or CR. sse-starlette emits CRLF, so splitting on "\n\n" matches nothing
+      // in "\r\n\r\n" (0D0A0D0A contains no 0A0A): every frame stays buffered,
+      // no token is ever emitted, and the stream renders as silence.
+      const events = buffer.split(/\r?\n\r?\n/);
+      buffer = events.pop() ?? "";
+      for (const raw of events) {
+        const { event, data } = parseEvent(raw);
+        if (event === "token") onToken(data);
+        else if (event === "sources") onSources(JSON.parse(data) as Source[]);
+        else if (event === "error") throw new Error(data || "the server reported an error");
+      }
     }
+  } catch (err) {
+    if (control.signal.aborted) {
+      throw new Error("Connection lost — the server stopped responding. Try again.");
+    }
+    throw err;
+  } finally {
+    clearTimeout(idle);
   }
 }
 
-function parseEvent(raw: string): { event: string; data: string } {
+export function parseEvent(raw: string): { event: string; data: string } {
   let event = "message";
   const dataLines: string[] = [];
-  for (const line of raw.split("\n")) {
+  for (const line of raw.split(/\r?\n/)) {
     if (line.startsWith("event:")) event = line.slice(6).trim();
+    // Only the leading space is padding; the rest of the line is the token, so
+    // trimming here would eat the spaces between words.
     else if (line.startsWith("data:")) dataLines.push(line.slice(5).replace(/^ /, ""));
   }
   return { event, data: dataLines.join("\n") };
