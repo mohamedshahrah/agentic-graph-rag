@@ -96,6 +96,23 @@ once per document. On a larger card both stay resident and it costs nothing.
 The lesson generalises: **the capability list is a claim, not a guarantee.** Test
 one page, one chunk, one query against the model you plan to use.
 
+### Size the model to the card
+
+A larger model that doesn't fit in VRAM is a *slower* model: Ollama runs the
+overflow on CPU, and that costs more than the quality gain is worth. Measured on
+a 6 GB card, same prompt, both warm:
+
+| Chat model | VRAM @ ctx 8192 | On GPU | Speed |
+|---|---|---|---|
+| `gemma4:e4b-it-q4_K_M` | 3.3 GB | **100%** | **41.2 tok/s** |
+| `qwen2.5:7b-instruct` | 5.4 GB | 79% | 27.7 tok/s |
+
+qwen2.5 is the stronger model with working tool calling, and it still loses by
+~50% here — it can't fit beside the ~1 GB the desktop holds, at any context (82%
+on GPU even at 4096). `ollama ps` is the test: below `100% GPU` you're paying for
+weights you can't use. On a bigger card this flips, which is why it's a config
+key rather than a default.
+
 ### Using a bigger Gemma 4 for chat
 
 Gemma 4 has native tool calling across the whole family (including the small

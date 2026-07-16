@@ -210,7 +210,7 @@ Change the key and restart — no code, no rebuild:
 ```yaml
 llm:
   model: qwen2.5:7b-instruct     # ollama pull it first
-  extra: { num_ctx: 8192 }       # keep an eye on `ollama ps`
+  extra: { num_ctx: 8192 }       # then check `ollama ps` — see below
 ```
 
 **Chat** — any Ollama model listing `tools` in `ollama show` (the agent binds
@@ -226,6 +226,27 @@ expansion looks like noise, this is the knob.
 **Reranking** — the least fussy: it only has to answer with a number. Any chat
 model, `cross_encoder` (faster and better, needs the `local-models` extra),
 `cohere` / `voyage`, or `none`.
+
+### A bigger model that doesn't fit is a slower model
+
+Reach for a larger model and you'll usually get a worse system, not a better one.
+The moment weights + KV cache exceed VRAM, Ollama runs the overflow on CPU and
+the quality gain is spent paying for it. Measured on a 6 GB card (RTX 2060),
+same prompt, both warm:
+
+| Chat model | VRAM @ ctx 8192 | On GPU | Speed |
+| --- | --- | --- | --- |
+| `gemma4:e4b-it-q4_K_M` (8B) | 3.3 GB | **100%** | **41.2 tok/s** |
+| `qwen2.5:7b-instruct` (7B) | 5.4 GB | 79% | 27.7 tok/s |
+
+qwen2.5 is the stronger model and its tool calling works — but at 5.4 GB it never
+fits alongside the ~1 GB the desktop already holds, so a fifth of it runs on CPU
+and it ends up **~50% slower**. No context helps: it's 82% on GPU even at 4096.
+
+So size the model to the card, not the benchmark. `ollama ps` is the whole test —
+anything under `100% GPU` means you're paying for weights you can't use. On a
+larger card the same comparison flips, which is exactly why this is a config key
+and not a hardcoded default.
 
 **OCR** — must be a *vision* model, and the capability list lies. `gemma3:4b`
 works; `gemma4:e4b-it-q4_K_M` advertises `vision` and silently ignores images.
