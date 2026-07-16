@@ -1,0 +1,60 @@
+# Fully local profile: no API keys, no model weights downloaded. Chat, OCR,
+# embeddings and reranking all run on the Ollama you already have.
+#
+# Prereqs:
+#   ollama pull gemma4:e4b-it-q4_K_M   # chat + reranking
+#   ollama pull gemma3:4b              # OCR + graph extraction (see note below)
+#   ollama pull bge-m3                 # embeddings
+#
+# --- Why num_ctx is set on every role ---
+# Ollama sizes the KV cache from num_ctx, and that cache — not the weights — is
+# what usually blows past a small GPU. gemma4:e4b at Ollama's default context is
+# 9.9 GB and lands 71% on CPU; the same model at num_ctx 8192 is 3.3 GB and runs
+# 100% on GPU. Measured on a 6 GB card: extraction went 50s -> 12s per chunk with
+# identical output. Raise these if you have VRAM to spare; `ollama ps` shows the
+# CPU/GPU split, and dropping below 100% GPU is the cliff to watch for.
+llm:
+  provider: ollama
+  model: gemma4:e4b-it-q4_K_M
+  extra:
+    num_ctx: 8192             # room for top_k chunks + history; 16384 spills to CPU
+
+embeddings:
+  provider: ollama
+  model: bge-m3:latest
+  # `bge-m3:latest` is an Ollama tag, not an HF repo id — name the tokenizer so
+  # chunk sizes are counted exactly rather than estimated.
+  tokenizer: BAAI/bge-m3
+
+# --- OCR reads with gemma3, everything else thinks with gemma4 ---
+# gemma4:e4b-it-q4_K_M advertises `vision` in `ollama show` but ignores attached
+# images — it answers "please provide the image", so OCR silently yields nothing.
+# gemma3:4b reads the same handwritten page correctly in ~13s. OCR must not use
+# gemma4. Extraction must not use gemma3: on notes full of transition tables it
+# ignores "skip document-local labels" and fills the graph with state names
+# (Q0..Q16), where gemma4 on the same prompt returns none.
+# Cost: the two are 3.3 GB each and can't co-reside on a 6 GB card, so ingest
+# swaps models once per document (~20s). Worth it — the alternative is a graph of
+# state labels. On a bigger card they both stay resident and it's free.
+ocr:
+  engine: vision_llm
+  vision_llm:
+    provider: ollama
+    model: gemma3:4b          # NOT gemma4 — its vision is broken, see above
+
+ingestion:
+  extract_graph: true         # set false for vector-only RAG and much faster ingest
+  llm:
+    provider: ollama
+    model: gemma4:e4b-it-q4_K_M   # NOT gemma3 — too noisy to follow the prompt
+    max_tokens: 2048
+    extra:
+      num_ctx: 4096           # one 384-token chunk in, JSON out — 8192 is wasted VRAM
+      reasoning: false        # thinking doubles the time for identical output
+
+retrieval:
+  rerank:
+    provider: ollama
+    model: gemma4:e4b-it-q4_K_M
+    extra:
+      num_ctx: 2048           # query + one chunk + a single number

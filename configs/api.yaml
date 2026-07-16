@@ -1,0 +1,29 @@
+# Cloud profile: best quality out of the box. Set the matching API keys in .env.
+#   ANTHROPIC_API_KEY  (reply LLM)
+#   GOOGLE_API_KEY     (OCR via Gemini; optionally Gemini embeddings)
+#   VOYAGE_API_KEY     (embeddings + rerank)   — or use OpenAI / Cohere
+llm:
+  provider: anthropic
+  model: claude-opus-4-8
+  temperature: 0.1
+  max_tokens: 4096
+  # Claude 4.x uses adaptive thinking; this passes through to ChatAnthropic.
+  extra:
+    thinking: { type: adaptive }
+
+embeddings:
+  provider: voyage
+  model: voyage-3-large
+  # Voyage handles batching/normalization server-side; prefixes not needed.
+  normalize: true
+
+ocr:
+  engine: vision_llm
+  vision_llm:
+    provider: gemini
+    model: gemini-2.5-flash
+
+retrieval:
+  rerank:
+    provider: voyage
+    model: rerank-2

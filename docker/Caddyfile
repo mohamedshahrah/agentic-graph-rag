@@ -1,0 +1,32 @@
+# Reverse proxy + TLS termination.
+#
+# SITE_ADDRESS controls TLS:
+#   :80                     plain HTTP (default; local dev, no certs)
+#   localhost               HTTPS with Caddy's local self-signed CA
+#   rag.example.com         HTTPS with automatic Let's Encrypt (set TLS_EMAIL)
+#
+# Behind this proxy the UI and API share one origin, so no CORS is needed.
+
+{
+	# Quoted so an unset TLS_EMAIL renders as an empty argument rather than a
+	# bare `email`, which Caddy rejects at parse time. Only used when
+	# SITE_ADDRESS is a real domain (Let's Encrypt contact).
+	email "{$TLS_EMAIL}"
+}
+
+{$SITE_ADDRESS::80} {
+	encode gzip
+
+	# API — strip the /api prefix and forward to the backend.
+	# flush_interval -1 disables response buffering so SSE streaming works.
+	handle_path /api/* {
+		reverse_proxy api:8000 {
+			flush_interval -1
+		}
+	}
+
+	# Everything else: the static React app.
+	handle {
+		reverse_proxy frontend:80
+	}
+}

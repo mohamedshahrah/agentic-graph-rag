@@ -1,0 +1,38 @@
+# Rendered at container start by nginx's envsubst entrypoint: ${MAX_UPLOAD_MB}
+# comes from the environment (see docker-compose.yml). Nginx variables like
+# $uri are left alone — only names that exist in the env are substituted.
+
+server {
+    listen 80;
+    server_name _;
+    root /usr/share/nginx/html;
+    index index.html;
+
+    # SPA routing
+    location / {
+        try_files $uri $uri/ /index.html;
+    }
+
+    location /api/ {
+        # Must not be below api.max_upload_mb, or nginx rejects uploads with a
+        # bare 413 before the API can apply its own limit and error message.
+        # Nginx defaults to 1m, which is smaller than most PDFs.
+        client_max_body_size ${MAX_UPLOAD_MB}m;
+
+        # Resolve the backend per request via Docker's embedded DNS. With a
+        # literal `proxy_pass http://api:8000`, nginx resolves once at startup
+        # and pins that IP — so rebuilding the api container (which gives it a
+        # new IP) 502s the whole UI until nginx is restarted by hand.
+        # A variable in proxy_pass is what defers resolution to request time;
+        # it also disables nginx's implicit prefix-strip, hence the rewrite.
+        resolver 127.0.0.11 valid=10s ipv6=off;
+        set $api_upstream api:8000;
+        rewrite ^/api/(.*)$ /$1 break;
+
+        proxy_pass http://$api_upstream;
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+        proxy_buffering off;             # required for SSE streaming
+        proxy_read_timeout 3600s;
+    }
+}

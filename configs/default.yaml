@@ -1,0 +1,146 @@
+# Shared defaults. A profile (local.yaml / api.yaml) is layered on top of this,
+# then environment variables (secrets, service URLs) override both.
+# Deep-merged in this order:  default.yaml < <profile>.yaml < env vars
+
+app:
+  name: agentic-graph-rag
+  log_level: INFO
+  # Namespace so multiple corpora can share one Neo4j instance.
+  corpus: default
+
+# --- Reply LLM (the agent) ----------------------------------------------------
+llm:
+  provider: ollama            # ollama | anthropic | openai | gemini
+  model: qwen2.5:7b-instruct
+  temperature: 0.1
+  max_tokens: 2048
+  # Extra provider kwargs pass straight through to the LangChain chat model.
+  extra: {}
+
+# --- Embeddings (rich control — see docs/CONFIGURATION.md) ---------------------
+embeddings:
+  # sentence_transformers | ollama | openai | gemini | voyage | cohere
+  # `sentence_transformers` runs the model in-process for full control over every
+  # knob below; it needs the `local-models` extra (it pulls torch, ~3.9 GB). Both
+  # shipped profiles override this — `local` uses ollama, `api` uses voyage.
+  provider: sentence_transformers
+  model: BAAI/bge-m3
+  tokenizer: null             # HF tokenizer for chunk sizing; defaults to `model`.
+                              # Set it when `model` isn't an HF repo id (e.g. the
+                              # Ollama tag `bge-m3:latest` -> BAAI/bge-m3).
+  dimensions: null            # truncate output dim if the model supports it (Matryoshka)
+  device: auto                # auto | cpu | cuda | mps
+  batch_size: 32
+  normalize: true
+  max_seq_length: 512
+  query_prefix: ""            # e.g. "query: " for e5-style models
+  document_prefix: ""
+  pooling: mean               # mean | cls | last_token  (sentence_transformers only)
+                              # note: pooling/max_seq_length/device are server-side
+                              # decisions under `ollama` and are ignored there
+  cache:
+    enabled: true             # cache vectors in Redis, keyed by (model, text)
+    ttl_seconds: 604800
+
+# --- Chunking (tokenizer taken from the embedder) -----------------------------
+chunking:
+  strategy: recursive         # recursive | token | semantic
+  max_tokens: 384
+  overlap: 64
+  semantic:
+    threshold: 0.75           # cosine-distance boundary for semantic splitting
+    min_chunk_tokens: 96
+
+# --- OCR (images / scanned PDFs -> text -> embeddings) ------------------------
+ocr:
+  enabled: true
+  engine: vision_llm          # vision_llm | tesseract
+  # Scanned pages often carry a thin text layer (a page number, a scanner
+  # header), so "extracted some text" != "read the page". Pages with a shorter
+  # text layer than this get OCR'd. 0 = only OCR pages that extract nothing,
+  # which silently misses any scan bearing a page label.
+  min_text_chars: 100
+  vision_llm:
+    provider: ollama          # ollama (gemma4) | gemini
+    model: gemma4:e4b         # swap to gemini-2.5-flash when provider=gemini
+    prompt: "Transcribe all text in this image exactly, preserving structure. Output only the text."
+  tesseract:
+    lang: eng
+
+# --- Storage (Neo4j default; adapter-based, swappable) ------------------------
+storage:
+  graph:
+    provider: neo4j
+    database: neo4j
+  vector:
+    provider: neo4j           # store vectors on :Chunk nodes in Neo4j
+    index_name: chunk_embeddings
+    similarity: cosine
+
+# --- Retrieval ----------------------------------------------------------------
+retrieval:
+  top_k: 8                    # final chunks handed to the LLM
+  candidate_k: 24            # candidates fetched before reranking
+  graph_hops: 2               # neighborhood depth for graph-augmented retrieval
+  rerank:
+    enabled: true
+    # cross_encoder            local HF model, one batched pass (needs the
+    #                          `local-models` extra — pulls torch, ~3.9 GB)
+    # ollama|anthropic|openai|gemini   a chat model scores each candidate (see below)
+    # cohere|voyage            hosted rerank endpoints
+    # none                     skip reranking
+    provider: cross_encoder
+    model: BAAI/bge-reranker-v2-m3
+    # --- generative rerank only (ignored by cross_encoder / cohere / voyage) ---
+    concurrency: 4            # parallel scoring calls; one call per candidate
+    max_tokens: 16            # enough for a bare number; raise if you enable reasoning
+    prompt: |-
+      Rate how well the document answers the query, from 0 to 10.
+      Reply with only the number.
+
+      Query: {query}
+
+      Document: {document}
+    extra: {}                 # provider kwargs; ollama defaults to reasoning: false
+
+# --- Agent --------------------------------------------------------------------
+agent:
+  memory: true                # multi-turn memory via Redis checkpointer
+  max_tool_iterations: 6
+  default_style: detailed     # concise | detailed | technical | eli5
+
+# --- Ingestion ----------------------------------------------------------------
+ingestion:
+  extract_graph: true         # run LLM entity/relation extraction into the KG
+                              # false -> vector-only RAG, dramatically faster ingest
+  max_concurrency: 4
+  # llm:                      # optional: dedicated extraction model (defaults to `llm`)
+  #   provider: ollama        # extraction sees one chunk at a time, so it needs far
+  #   model: gemma3:4b        # less context than chat — and on a small GPU, context
+  #   extra: {num_ctx: 4096}  # size is what decides whether it fits in VRAM
+
+# --- Auth ---------------------------------------------------------------------
+auth:
+  enabled: false              # true: require an API key (Authorization: Bearer)
+                              #       the verified key sets the user; X-User-Id ignored
+                              # set GRAPHRAG_ADMIN_KEY in .env to gate user creation
+
+# --- Multi-user ---------------------------------------------------------------
+tenancy:
+  enabled: true
+  default_user: default
+  per_tenant_database: false  # false: isolate by corpus (Community); true: DB per user (Enterprise)
+  database_prefix: u_
+  max_active_tenants: 256     # bound the per-user cache (heavy models stay shared)
+
+# --- API ----------------------------------------------------------------------
+api:
+  cors_origins: ["http://localhost:5173"]
+  cors_methods: ["GET", "POST", "OPTIONS"]
+  cors_headers: ["Content-Type", "X-User-Id", "Authorization"]
+  stream: true
+  rate_limit: "60/minute"     # per user; falls back to client IP
+  max_upload_mb: 25           # reject larger uploads. Raising this alone isn't
+                              # enough: MAX_UPLOAD_MB in .env must be >= it, or
+                              # the frontend's nginx 413s the upload first.
+  max_files_per_user: 10      # cap on uploaded files per user

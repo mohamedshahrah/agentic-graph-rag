@@ -1,0 +1,27 @@
+# Same as `local`, but with a larger Gemma 4 for chat — steadier tool calling if
+# you have the RAM. Everything still runs on Ollama; no weights are downloaded.
+#
+# Prereqs:
+#   ollama pull gemma4:12b             # chat — steadier tool use
+#   ollama pull gemma4:e4b-it-q4_K_M   # OCR + reranking — small, multimodal
+#   ollama pull bge-m3                 # embeddings
+llm:
+  provider: ollama
+  model: gemma4:12b
+  temperature: 0.1
+
+embeddings:
+  provider: ollama
+  model: bge-m3:latest
+  tokenizer: BAAI/bge-m3
+
+ocr:
+  engine: vision_llm
+  vision_llm:
+    provider: ollama
+    model: gemma4:e4b-it-q4_K_M
+
+retrieval:
+  rerank:
+    provider: ollama
+    model: gemma4:e4b-it-q4_K_M

@@ -1,0 +1,161 @@
+# One command brings up the whole system:  docker compose up -d
+#
+# Services:
+#   neo4j     graph + vector store        http://localhost:7474
+#   redis     memory / cache / queue
+#   api       FastAPI service             http://localhost:8000  (docs at /docs)
+#   worker    ingest queue worker (Arq)   — heavy work runs here, off the API
+#   frontend  React chat UI               http://localhost:5173
+#   ollama    local models (opt-in)       profile: local
+#
+# The `local` config profile talks to Ollama on your host by default, reusing
+# models you've already pulled. The bundled `ollama` service is only for hosts
+# without one — see GRAPHRAG_OLLAMA_BASE_URL below.
+#
+# RAM / CPU per service are capped via .env (see the *_MEM_LIMIT / *_CPU_LIMIT
+# knobs). Tune them for your machine. Fully local? add `--profile local`.
+
+name: agentic-graph-rag
+
+services:
+  neo4j:
+    image: neo4j:5.23
+    environment:
+      NEO4J_AUTH: neo4j/${GRAPHRAG_NEO4J_PASSWORD:-please-change-me}
+      NEO4J_PLUGINS: '["apoc"]'
+      NEO4J_dbms_security_procedures_unrestricted: apoc.*
+      # Bound Neo4j's memory so it can't starve the host.
+      NEO4J_server_memory_heap_max__size: ${NEO4J_HEAP:-1G}
+      NEO4J_server_memory_pagecache_size: ${NEO4J_PAGECACHE:-512M}
+    ports: ["7474:7474", "7687:7687"]
+    volumes: ["neo4j_data:/data"]
+    deploy:
+      resources:
+        limits: { cpus: "${NEO4J_CPU_LIMIT:-1.5}", memory: "${NEO4J_MEM_LIMIT:-2g}" }
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:7474 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
+  redis:
+    # Redis 8, not 7: langgraph's checkpointer needs the query engine (FT.*) for
+    # durable agent memory, and 8 bundles it into core. On 7 the checkpointer
+    # fails at startup and silently degrades to in-process memory.
+    image: redis:8-alpine
+    command: ["redis-server", "--maxmemory", "${REDIS_MAXMEMORY:-384mb}", "--maxmemory-policy", "allkeys-lru"]
+    ports: ["6379:6379"]
+    volumes: ["redis_data:/data"]
+    deploy:
+      resources:
+        limits: { cpus: "${REDIS_CPU_LIMIT:-0.5}", memory: "${REDIS_MEM_LIMIT:-512m}" }
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+
+  api:
+    build: { context: ., dockerfile: docker/Dockerfile }
+    env_file: [.env]
+    environment: &backend_env
+      GRAPHRAG_PROFILE: ${GRAPHRAG_PROFILE:-api}
+      GRAPHRAG_NEO4J_URI: bolt://neo4j:7687
+      GRAPHRAG_REDIS_URL: redis://redis:6379/0
+      # Ollama on the host, so containers reuse models you've already pulled.
+      # Running the bundled `ollama` service instead (--profile local)? Point
+      # this at http://ollama:11434 and pull the models inside that container.
+      GRAPHRAG_OLLAMA_BASE_URL: ${GRAPHRAG_OLLAMA_BASE_URL_INTERNAL:-http://host.docker.internal:11434}
+      # Cap CPU-thread fan-out so limits are actually respected.
+      OMP_NUM_THREADS: ${OMP_NUM_THREADS:-2}
+      TOKENIZERS_PARALLELISM: "false"
+    ports: ["8000:8000"]
+    depends_on:
+      neo4j: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    extra_hosts: ["host.docker.internal:host-gateway"]
+    volumes:
+      - ./data:/app/data
+      - hf_cache:/app/.cache/huggingface   # reranker weights: download once, share with worker
+    deploy:
+      resources:
+        limits: { cpus: "${API_CPU_LIMIT:-2}", memory: "${API_MEM_LIMIT:-4g}" }
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      # Startup builds the default tenant, which loads the reranker — a ~2.2 GB
+      # download the very first time, then cached in the hf_cache volume.
+      start_period: 120s
+
+  worker:
+    build: { context: ., dockerfile: docker/Dockerfile }
+    command: ["arq", "graphrag.worker.WorkerSettings"]
+    # The image's HEALTHCHECK probes the API's HTTP port; the worker serves no
+    # HTTP, so inheriting it would mark a healthy worker unhealthy forever.
+    healthcheck: { disable: true }
+    env_file: [.env]
+    environment:
+      <<: *backend_env
+      GRAPHRAG_WORKER_CONCURRENCY: ${GRAPHRAG_WORKER_CONCURRENCY:-2}
+    depends_on:
+      neo4j: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    extra_hosts: ["host.docker.internal:host-gateway"]
+    volumes:
+      - ./data:/app/data
+      - hf_cache:/app/.cache/huggingface
+    deploy:
+      resources:
+        limits: { cpus: "${WORKER_CPU_LIMIT:-2}", memory: "${WORKER_MEM_LIMIT:-4g}" }
+
+  frontend:
+    build: { context: ./frontend }
+    environment:
+      # nginx's upload ceiling. Keep it >= api.max_upload_mb (configs/*.yaml) —
+      # below it, nginx 413s uploads before the API ever sees them.
+      MAX_UPLOAD_MB: ${MAX_UPLOAD_MB:-25}
+    ports: ["5173:80"]
+    depends_on:
+      api: { condition: service_healthy }
+    deploy:
+      resources:
+        limits: { cpus: "${FRONTEND_CPU_LIMIT:-0.5}", memory: "${FRONTEND_MEM_LIMIT:-128m}" }
+
+  ollama:
+    image: ollama/ollama:latest
+    profiles: ["local"]
+    ports: ["11434:11434"]
+    volumes: ["ollama_data:/root/.ollama"]
+    deploy:
+      resources:
+        limits: { cpus: "${OLLAMA_CPU_LIMIT:-4}", memory: "${OLLAMA_MEM_LIMIT:-8g}" }
+
+  # TLS termination + reverse proxy. This is the public entrypoint (80/443).
+  # For a real deployment, remove the host `ports` from api/frontend above so
+  # only the proxy is reachable from outside.
+  proxy:
+    image: caddy:2-alpine
+    environment:
+      SITE_ADDRESS: ${SITE_ADDRESS:-:80}   # -> localhost or a domain to enable HTTPS
+      TLS_EMAIL: ${TLS_EMAIL:-}
+    ports: ["80:80", "443:443"]
+    volumes:
+      - ./docker/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data           # persisted certs
+      - caddy_config:/config
+    depends_on:
+      api: { condition: service_healthy }
+      frontend: { condition: service_started }
+    deploy:
+      resources:
+        limits: { cpus: "${PROXY_CPU_LIMIT:-0.5}", memory: "${PROXY_MEM_LIMIT:-128m}" }
+
+volumes:
+  neo4j_data:
+  redis_data:
+  ollama_data:
+  hf_cache:
+  caddy_data:
+  caddy_config:
