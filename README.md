@@ -279,26 +279,132 @@ before trusting it.
 
 ## Project layout
 
+The shape follows the two things the system does: **put documents in** and **get
+answers out**. Read it in that order and it explains itself.
+
 ```
 src/graphrag/
-  config/       layered settings + secrets
-  core/         domain types, errors, logging
-  ingestion/    loaders · chunking (token / recursive / semantic) · KG extraction
-  ocr/          vision-LLM (Ollama / Gemini) · Tesseract
-  embeddings/   Ollama · API providers · in-process (optional extra), Redis-cached
-  llm/          one factory across Ollama / Claude / OpenAI / Gemini
-  storage/      GraphStore + VectorStore interfaces → Neo4j adapter
-  retrieval/    vector · graph-augmented · hybrid · RRF fusion · rerank
-  agent/        LangGraph loop · tools · answer styles
-  pipelines/    ingest · query
-  api/          FastAPI app, routers, SSE streaming
-  container.py  the composition root (all wiring, one place)
-frontend/       React + Vite chat UI (own Docker container)
+├── core/           Domain vocabulary. Everything else imports FROM here.
+│   ├── types.py      Document · Chunk · Entity · Relation · RetrievedChunk
+│   ├── errors.py     ConfigError · ProviderError · IngestionError · StorageError
+│   └── logging.py    structlog setup (structured key=value logs)
+│
+├── config/         Layered settings: default.yaml < <profile>.yaml < env
+│   ├── settings.py   Typed models. Every knob in the system is a field here.
+│   └── loader.py     Deep-merges the YAML layers, reads secrets from env
+│
+├── ─────────────── INGEST SIDE: file ──▶ graph + vectors ───────────────
+│
+├── ocr/            Picture of text ──▶ text
+│   ├── vision_llm.py Sends the page image to a vision model
+│   └── tesseract.py  Offline fallback, no model needed
+│
+├── ingestion/      The ingest half, in pipeline order
+│   ├── loaders/      PDF · text · image ──▶ Document (OCR when a page is a scan)
+│   ├── chunking/     Document ──▶ Chunks. Three strategies:
+│   │                   token     fixed windows, exact
+│   │                   recursive split on structure, then size  (default)
+│   │                   semantic  split where meaning shifts (uses the embedder)
+│   └── extraction/   Chunk ──▶ Entities + Relations, via an LLM
+│
+├── embeddings/     Text ──▶ vectors. One `Embedder` interface, several backends
+│   ├── ollama.py     Reuses a model you've pulled (no weights downloaded)
+│   ├── sentence_transformers.py  In-process, full control (optional extra)
+│   ├── api_providers.py          OpenAI · Gemini · Voyage · Cohere
+│   └── cache.py      Redis cache keyed by (model, text) — re-ingest is cheap
+│
+├── ─────────────── QUERY SIDE: question ──▶ answer ─────────────────────
+│
+├── retrieval/      Finding the right chunks. The interesting part.
+│   ├── vector.py           Nearest-neighbour by meaning
+│   ├── graph_augmented.py  Follows relationships out from matched entities
+│   ├── hybrid.py           Runs several retrievers and combines them
+│   ├── fusion.py           Reciprocal Rank Fusion — merges ranked lists fairly
+│   └── reranker.py         Re-scores candidates (candidate_k ──▶ top_k)
+│
+├── agent/          Decides HOW to retrieve — this is the "agentic" part
+│   ├── graph.py      LangGraph loop: think ──▶ call tool ──▶ look ──▶ repeat
+│   ├── tools.py      What the agent may call: vector_search, graph_neighbors, …
+│   ├── prompts.py    System prompts that steer the loop
+│   └── styles.py     concise / detailed / technical / eli5
+│
+├── ─────────────── PLUMBING ────────────────────────────────────────────
+│
+├── llm/factory.py  One function ──▶ a chat model for any provider
+├── storage/        GraphStore + VectorStore interfaces ──▶ Neo4j adapter
+├── pipelines/      Wires the above into `ingest` and `query` flows
+├── jobs.py         Ingest job status, persisted in Redis
+├── worker.py       Arq worker — runs ingest off the API process
+├── auth.py         API keys (SHA-256 hashed) — the key identifies the user
+├── __main__.py     The `graphrag` CLI
+├── api/            FastAPI: routers · SSE streaming · deps
+└── container.py    Composition root: reads config, builds everything, once
+
+frontend/           React + Vite chat UI, served by nginx (own container)
+configs/            The YAML profiles — default · local · api · local-gemma
+docker/             API image + Caddy reverse-proxy config
+tests/unit/         Fast, no services needed. Start here to learn the codebase.
 ```
 
-Each layer talks to the next through an interface, so replacing a piece (a
-different LLM, an embedded graph DB) means writing one adapter — not editing the
-layers around it.
+### How a request moves through it
+
+**Ingesting** `report.pdf`:
+
+```
+api/routers/ingest.py   accepts the upload, queues a job
+        │
+worker.py               picks it up (so a big PDF never blocks the API)
+        │
+pipelines/ingest.py     drives the rest:
+  loaders/pdf.py          PDF ──▶ text   (ocr/ if a page is a scan)
+  chunking/               text ──▶ chunks
+  embeddings/             chunks ──▶ vectors ──▶ storage/vector  (Neo4j index)
+  extraction/             chunks ──▶ entities + relations ──▶ storage/graph
+```
+
+**Answering** *"How are Acme and Riverside connected?"*:
+
+```
+api/routers/query.py    receives it, opens an SSE stream
+        │
+pipelines/query.py      starts an agent session
+        │
+agent/graph.py          the loop: which tool would answer this?
+        │                   └── calls a tool from agent/tools.py
+retrieval/hybrid.py         vector + graph + keyword, in parallel
+retrieval/fusion.py         merge the ranked lists (RRF)
+retrieval/reranker.py       score candidate_k ──▶ keep top_k
+        │
+agent/graph.py          reads the chunks, answers (or calls another tool)
+        │
+api/streaming.py        tokens ──▶ browser, then the sources behind them
+```
+
+### Why it's shaped this way
+
+**`core/` depends on nothing.** Types and errors sit at the bottom, so no two
+modules ever need to import each other to agree on what a `Chunk` is.
+
+**Every provider hides behind an interface.** `Embedder`, `GraphStore`,
+`VectorStore`, `Reranker`, `OCREngine` — each is a small abstract class with a
+concrete implementation per backend. Swapping Ollama for OpenAI is one new class
+and one config line; nothing around it changes. That's why every model in this
+README is a config key and not an `if` statement somewhere.
+
+**`container.py` is the only place that knows how the pieces fit.** It reads the
+config and builds the object graph once. Heavy things (models, drivers) are
+`@cached_property`, so they load on first use and are shared by every user. That's
+why adding users costs almost no memory — only the small per-tenant wrappers are
+duplicated.
+
+**Ingest and query are separate processes.** The worker does the slow work
+(OCR, embedding, extraction) so the API stays responsive, and you can cap their
+resources independently in `docker-compose.yml`.
+
+**Reading it for the first time?** `core/types.py` (the vocabulary) ──▶
+`configs/default.yaml` (every knob, commented) ──▶ `container.py` (how it's
+wired) ──▶ `pipelines/` (the two flows end to end). `tests/unit/` runs in under a
+second with no Neo4j or Ollama, and each test documents one real failure mode.
 
 ---
 

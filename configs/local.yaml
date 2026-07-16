@@ -53,6 +53,11 @@ ingestion:
       reasoning: false        # thinking doubles the time for identical output
 
 retrieval:
+  # Generative reranking costs one LLM call per candidate, so candidate_k is the
+  # dial on query latency here — unlike the `api` profile, where Voyage scores
+  # the whole batch in one request and 24 is nearly free. 12 halves the rerank
+  # work; the cost is recall, since a chunk outside the top 12 can't be rescued.
+  candidate_k: 12
   rerank:
     provider: ollama
     model: gemma4:e4b-it-q4_K_M

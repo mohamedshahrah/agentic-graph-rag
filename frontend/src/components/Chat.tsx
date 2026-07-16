@@ -50,7 +50,11 @@ export default function Chat({ style }: { style: string }) {
         )}
         {turns.map((turn, i) => (
           <div key={i} className="space-y-1">
-            <Message role={turn.role} text={turn.text} />
+            <Message
+              role={turn.role}
+              text={turn.text}
+              pending={busy && i === turns.length - 1}
+            />
             {turn.role === "assistant" && <Sources sources={turn.sources ?? []} />}
           </div>
         ))}
