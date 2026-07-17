@@ -8,10 +8,6 @@
 #   frontend  React chat UI               http://localhost:5173
 #   ollama    local models (opt-in)       profile: local
 #
-# The `local` config profile talks to Ollama on your host by default, reusing
-# models you've already pulled. The bundled `ollama` service is only for hosts
-# without one — see GRAPHRAG_OLLAMA_BASE_URL below.
-#
 # RAM / CPU per service are capped via .env (see the *_MEM_LIMIT / *_CPU_LIMIT
 # knobs). Tune them for your machine. Fully local? add `--profile local`.
 
@@ -21,7 +17,7 @@ services:
   neo4j:
     image: neo4j:5.23
     environment:
-      NEO4J_AUTH: neo4j/${GRAPHRAG_NEO4J_PASSWORD:-please-change-me}
+      NEO4J_AUTH: neo4j/${GRAPHRAG_NEO4J_PASSWORD:-12345678}
       NEO4J_PLUGINS: '["apoc"]'
       NEO4J_dbms_security_procedures_unrestricted: apoc.*
       # Bound Neo4j's memory so it can't starve the host.
@@ -39,10 +35,7 @@ services:
       retries: 20
 
   redis:
-    # Redis 8, not 7: langgraph's checkpointer needs the query engine (FT.*) for
-    # durable agent memory, and 8 bundles it into core. On 7 the checkpointer
-    # fails at startup and silently degrades to in-process memory.
-    image: redis:8-alpine
+    image: redis:7-alpine
     command: ["redis-server", "--maxmemory", "${REDIS_MAXMEMORY:-384mb}", "--maxmemory-policy", "allkeys-lru"]
     ports: ["6379:6379"]
     volumes: ["redis_data:/data"]
@@ -59,13 +52,10 @@ services:
     build: { context: ., dockerfile: docker/Dockerfile }
     env_file: [.env]
     environment: &backend_env
-      GRAPHRAG_PROFILE: ${GRAPHRAG_PROFILE:-api}
+      GRAPHRAG_PROFILE: ${GRAPHRAG_PROFILE:-local}
       GRAPHRAG_NEO4J_URI: bolt://neo4j:7687
       GRAPHRAG_REDIS_URL: redis://redis:6379/0
-      # Ollama on the host, so containers reuse models you've already pulled.
-      # Running the bundled `ollama` service instead (--profile local)? Point
-      # this at http://ollama:11434 and pull the models inside that container.
-      GRAPHRAG_OLLAMA_BASE_URL: ${GRAPHRAG_OLLAMA_BASE_URL_INTERNAL:-http://host.docker.internal:11434}
+      GRAPHRAG_OLLAMA_BASE_URL: http://ollama:11434
       # Cap CPU-thread fan-out so limits are actually respected.
       OMP_NUM_THREADS: ${OMP_NUM_THREADS:-2}
       TOKENIZERS_PARALLELISM: "false"
@@ -73,10 +63,7 @@ services:
     depends_on:
       neo4j: { condition: service_healthy }
       redis: { condition: service_healthy }
-    extra_hosts: ["host.docker.internal:host-gateway"]
-    volumes:
-      - ./data:/app/data
-      - hf_cache:/app/.cache/huggingface   # reranker weights: download once, share with worker
+    volumes: ["./data:/app/data"]
     deploy:
       resources:
         limits: { cpus: "${API_CPU_LIMIT:-2}", memory: "${API_MEM_LIMIT:-4g}" }
@@ -85,16 +72,11 @@ services:
       interval: 10s
       timeout: 5s
       retries: 30
-      # Startup builds the default tenant, which loads the reranker — a ~2.2 GB
-      # download the very first time, then cached in the hf_cache volume.
-      start_period: 120s
+      start_period: 60s   # first boot may download local models
 
   worker:
     build: { context: ., dockerfile: docker/Dockerfile }
     command: ["arq", "graphrag.worker.WorkerSettings"]
-    # The image's HEALTHCHECK probes the API's HTTP port; the worker serves no
-    # HTTP, so inheriting it would mark a healthy worker unhealthy forever.
-    healthcheck: { disable: true }
     env_file: [.env]
     environment:
       <<: *backend_env
@@ -102,20 +84,13 @@ services:
     depends_on:
       neo4j: { condition: service_healthy }
       redis: { condition: service_healthy }
-    extra_hosts: ["host.docker.internal:host-gateway"]
-    volumes:
-      - ./data:/app/data
-      - hf_cache:/app/.cache/huggingface
+    volumes: ["./data:/app/data"]
     deploy:
       resources:
         limits: { cpus: "${WORKER_CPU_LIMIT:-2}", memory: "${WORKER_MEM_LIMIT:-4g}" }
 
   frontend:
     build: { context: ./frontend }
-    environment:
-      # nginx's upload ceiling. Keep it >= api.max_upload_mb (configs/*.yaml) —
-      # below it, nginx 413s uploads before the API ever sees them.
-      MAX_UPLOAD_MB: ${MAX_UPLOAD_MB:-25}
     ports: ["5173:80"]
     depends_on:
       api: { condition: service_healthy }
@@ -156,6 +131,5 @@ volumes:
   neo4j_data:
   redis_data:
   ollama_data:
-  hf_cache:
   caddy_data:
   caddy_config:
