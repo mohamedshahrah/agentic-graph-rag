@@ -47,7 +47,6 @@ class EmbeddingCfg(BaseModel):
     max_seq_length: int = 512
     query_prefix: str = ""
     document_prefix: str = ""
-    pooling: str = "mean"
     cache: EmbeddingCacheCfg = Field(default_factory=EmbeddingCacheCfg)
 
 
@@ -65,7 +64,9 @@ class ChunkingCfg(BaseModel):
 
 class VisionLLMCfg(BaseModel):
     provider: str = "ollama"
-    model: str = "gemma4:e4b"
+    # gemma3:4b, NOT gemma4 — gemma4:e4b advertises `vision` and then ignores
+    # attached images, which OCR cannot tell apart from a blank page.
+    model: str = "gemma3:4b"
     prompt: str = (
         "Transcribe all text in this image exactly, preserving structure. "
         "Output only the text."
@@ -95,9 +96,10 @@ class GraphStoreCfg(BaseModel):
 
 
 class VectorStoreCfg(BaseModel):
-    provider: str = "neo4j"
+    provider: str = "neo4j"  # neo4j | local (numpy files under `local_dir`)
     index_name: str = "chunk_embeddings"
     similarity: str = "cosine"
+    local_dir: str = "data/vectors"  # only used by provider: local
 
 
 class StorageCfg(BaseModel):
@@ -134,14 +136,36 @@ class AgentCfg(BaseModel):
     default_style: str = "detailed"
 
 
+class CommunityCfg(BaseModel):
+    # Cluster the entity graph into communities and LLM-summarize each, giving
+    # the agent a `global_search` tool for corpus-wide questions that no single
+    # chunk answers. Rebuilt at the end of each ingest.
+    enabled: bool = True
+    max_communities: int = 12   # summarize at most this many (largest first)
+    min_size: int = 3           # ignore components smaller than this
+
+
+class EntityResolutionCfg(BaseModel):
+    # Merge entities that name the same thing ("Acme" / "Acme Robotics"): exact
+    # containment plus embedding similarity over names. Conservative on purpose —
+    # a wrong merge is worse than a missed one.
+    enabled: bool = True
+    similarity: float = 0.93    # cosine threshold for name-embedding merges
+
+
 class IngestionCfg(BaseModel):
     extract_graph: bool = True
+    # Parallel LLM extraction calls per document (the slow part of ingest).
+    # Writes stay serial — concurrent MERGEs on the same keys just fight for
+    # locks.
     max_concurrency: int = 4
     # Model used to pull entities/relations out of each chunk. Defaults to the
     # top-level `llm` when unset. Worth splitting out: extraction sees one chunk
     # at a time, so it needs far less context than chat — and on a small GPU the
     # context size is what decides whether the model fits in VRAM at all.
     llm: LLMCfg | None = None
+    resolve_entities: EntityResolutionCfg = Field(default_factory=EntityResolutionCfg)
+    communities: CommunityCfg = Field(default_factory=CommunityCfg)
 
 
 class AuthCfg(BaseModel):
@@ -170,7 +194,9 @@ class APICfg(BaseModel):
     cors_origins: list[str] = Field(default_factory=lambda: ["http://localhost:5173"])
     cors_methods: list[str] = Field(default_factory=lambda: ["GET", "POST", "OPTIONS"])
     cors_headers: list[str] = Field(
-        default_factory=lambda: ["Content-Type", "X-User-Id", "Authorization"]
+        default_factory=lambda: [
+            "Content-Type", "X-User-Id", "Authorization", "X-API-Key", "X-Admin-Key",
+        ]
     )
     stream: bool = True
     rate_limit: str = "60/minute"      # per user (falls back to client IP)

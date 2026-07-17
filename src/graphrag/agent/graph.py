@@ -1,6 +1,6 @@
 """The LangGraph agent. Wires the chat model + tools into a ReAct loop with
-optional Redis-backed multi-turn memory, and exposes both a blocking `run` and a
-token-streaming `astream_tokens`."""
+optional Redis-backed multi-turn memory, and exposes a blocking `run`, an async
+`arun`, and a token-streaming `astream_events`."""
 
 from __future__ import annotations
 
@@ -27,26 +27,45 @@ def _text(content) -> str:
     return str(content)
 
 
-def build_checkpointer(redis_url: str | None, enabled: bool):
-    """Durable agent memory in Redis (survives restarts / shared across replicas)
-    when available; otherwise in-process memory; otherwise none."""
+def build_checkpointer(
+    redis_url: str | None,
+    enabled: bool,
+    *,
+    use_async: bool = False,
+    redis_available: bool = True,
+):
+    """Durable agent memory in Redis when it is actually reachable; otherwise
+    in-process memory. Both Redis savers share one keyspace, so CLI (sync) and
+    API (async) see the same threads.
+
+    `use_async` picks the saver flavor. The API needs AsyncRedisSaver — its
+    /query streams over `astream`, which needs `aget_tuple`; the sync RedisSaver
+    inherits a base that raises NotImplementedError there. The CLI is the mirror
+    image: it calls the sync `invoke`, which the async saver refuses. Neither
+    flavor covers both, hence the flag.
+
+    `redis_available` must be a real connectivity check. The savers connect
+    lazily, so constructing one against a dead Redis "succeeds" and then every
+    query fails at checkpoint time — with the check, an unreachable Redis
+    degrades to in-process memory instead.
+    """
     if not enabled:
         return None
-    if redis_url:
+    if redis_url and redis_available:
         try:
-            # AsyncRedisSaver, not RedisSaver: /query streams over `astream`,
-            # which needs `aget_tuple`. RedisSaver implements only the sync half
-            # and inherits a base that raises NotImplementedError for the rest —
-            # so streaming dies instantly while the non-streaming path works.
-            from langgraph.checkpoint.redis import AsyncRedisSaver
+            if use_async:
+                from langgraph.checkpoint.redis import AsyncRedisSaver
 
-            # Deliberately unset: `asetup()` is a coroutine and this is sync, and
-            # driving one with asyncio.run() would bind the async Redis client to
-            # a loop that closes on the way out. The API awaits asetup() during
-            # its lifespan instead, on the loop that will actually serve requests
-            # (see api/app.py). Until then the saver raises a clear RuntimeError
-            # rather than misbehaving.
-            saver = AsyncRedisSaver(redis_url=redis_url)
+                # `asetup()` is awaited in the API lifespan, on the loop that
+                # serves requests — driving it here with asyncio.run() would
+                # bind the async client to a loop that closes on the way out.
+                saver = AsyncRedisSaver(redis_url=redis_url)
+                log.info("agent_memory", backend="redis-async")
+                return saver
+            from langgraph.checkpoint.redis import RedisSaver
+
+            saver = RedisSaver(redis_url=redis_url)
+            saver.setup()
             log.info("agent_memory", backend="redis")
             return saver
         except Exception as exc:  # package missing or incompatible -> fall back
@@ -70,8 +89,7 @@ class AgentSession:
     def sources(self) -> list[RetrievedChunk]:
         return self._ctx.collected
 
-    def run(self) -> QueryResult:
-        result = self._agent.invoke(self._input, self._config)
+    def _shape(self, result) -> QueryResult:
         messages = result["messages"]
         answer = next(
             (_text(m.content) for m in reversed(messages)
@@ -85,16 +103,39 @@ class AgentSession:
         ]
         return QueryResult(answer=answer, sources=self.sources, tool_calls=tool_calls)
 
-    async def astream_tokens(self) -> AsyncIterator[str]:
+    def run(self) -> QueryResult:
+        """Blocking run — CLI and scripts. Needs a sync-capable checkpointer."""
+        return self._shape(self._agent.invoke(self._input, self._config))
+
+    async def arun(self) -> QueryResult:
+        """Async run — the API's non-streaming path."""
+        return self._shape(await self._agent.ainvoke(self._input, self._config))
+
+    async def astream_events(self) -> AsyncIterator[tuple[str, str]]:
+        """Yield ("tool", name) when the model starts a tool call and
+        ("token", text) for answer text. Text produced *before* a tool call
+        (thinking out loud) is separated from the final answer with a blank
+        line, so streamed and non-streamed outputs read the same."""
+        emitted_text = False
+        boundary_pending = False
         async for msg, _meta in self._agent.astream(
             self._input, self._config, stream_mode="messages"
         ):
             if isinstance(msg, ToolMessage):
+                if emitted_text:
+                    boundary_pending = True
                 continue
             if isinstance(msg, AIMessageChunk):
+                for tc in msg.tool_call_chunks or []:
+                    if tc.get("name"):
+                        yield "tool", tc["name"]
                 text = _text(msg.content)
                 if text:
-                    yield text
+                    if boundary_pending:
+                        yield "token", "\n\n"
+                        boundary_pending = False
+                    emitted_text = True
+                    yield "token", text
 
 
 class AgentRunner:
@@ -104,20 +145,26 @@ class AgentRunner:
         vector,
         hybrid,
         graph,
+        embedder,
         checkpointer=None,
         *,
         top_k: int = 8,
         graph_hops: int = 2,
         default_style: str = "detailed",
+        max_tool_iterations: int = 6,
     ) -> None:
         self._model = model
         self._vector = vector
         self._hybrid = hybrid
         self._graph = graph
+        self._embedder = embedder
         self._checkpointer = checkpointer
         self._top_k = top_k
         self._graph_hops = graph_hops
         self._default_style = default_style
+        # One tool iteration is two graph supersteps (agent -> tools), plus one
+        # final answer step. This is what bounds a looping agent.
+        self._recursion_limit = 2 * max(1, max_tool_iterations) + 1
 
     def _make_agent(self, ctx: ToolContext):
         tools = build_tools(ctx)
@@ -137,11 +184,15 @@ class AgentRunner:
             vector=self._vector,
             hybrid=self._hybrid,
             graph=self._graph,
+            embedder=self._embedder,
             top_k=self._top_k,
             graph_hops=self._graph_hops,
         )
         agent = self._make_agent(ctx)
         instruction = style_instruction(style or self._default_style)
         styled = f"{instruction}\n\nQuestion: {question}"
-        config = {"configurable": {"thread_id": thread_id}}
+        config = {
+            "configurable": {"thread_id": thread_id},
+            "recursion_limit": self._recursion_limit,
+        }
         return AgentSession(agent, styled, config, ctx)

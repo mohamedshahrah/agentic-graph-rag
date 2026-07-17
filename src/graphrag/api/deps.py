@@ -28,7 +28,7 @@ def get_key_store(request: Request) -> KeyStore:
     return request.app.state.key_store
 
 
-def _extract_key(request: Request) -> str | None:
+def extract_key(request: Request) -> str | None:
     auth = request.headers.get("Authorization")
     if auth and auth.lower().startswith("bearer "):
         return auth[7:].strip()
@@ -42,7 +42,7 @@ def get_current_user(request: Request) -> str | None:
     if not container.settings.auth.enabled:
         return request.headers.get("X-User-Id")
 
-    key = _extract_key(request)
+    key = extract_key(request)
     if not key:
         raise HTTPException(status_code=401, detail="Missing API key")
     user = request.app.state.key_store.resolve(key)
@@ -52,9 +52,20 @@ def get_current_user(request: Request) -> str | None:
 
 
 def require_admin(request: Request) -> None:
-    """Gate an operation behind the admin key (only enforced when auth is on and
-    an admin key is configured)."""
+    """Gate user management behind the admin key.
+
+    Fail closed: with auth enabled and no admin key configured, user creation is
+    *locked*, not open — otherwise anyone could mint themselves a valid API key
+    and the auth requirement would be decorative. Dev mode (auth off) stays open.
+    """
     container: Container = request.app.state.container
+    if not container.settings.auth.enabled:
+        return
     admin = container.secrets.admin_api_key
-    if container.settings.auth.enabled and admin and request.headers.get("X-Admin-Key") != admin:
+    if not admin:
+        raise HTTPException(
+            status_code=403,
+            detail="User management is locked: set GRAPHRAG_ADMIN_KEY on the server",
+        )
+    if request.headers.get("X-Admin-Key") != admin:
         raise HTTPException(status_code=403, detail="Admin key required")

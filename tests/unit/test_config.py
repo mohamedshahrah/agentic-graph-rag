@@ -33,8 +33,16 @@ def test_rich_embedding_knobs_present():
     settings, _ = load_settings(profile="local")
     emb = settings.embeddings
     # The fine-grained controls the user asked for must survive the merge.
-    for field in ("batch_size", "normalize", "max_seq_length", "query_prefix", "pooling"):
+    for field in ("batch_size", "normalize", "max_seq_length", "query_prefix"):
         assert hasattr(emb, field)
+
+
+def test_enrichment_defaults():
+    settings, _ = load_settings(profile="local")
+    ing = settings.ingestion
+    assert ing.resolve_entities.enabled is True
+    assert ing.communities.enabled is True
+    assert ing.communities.min_size >= 2
 
 
 def test_tenancy_defaults():

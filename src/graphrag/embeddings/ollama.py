@@ -1,6 +1,6 @@
 """Embeddings from a local Ollama server.
 
-Ollama runs the model itself, so it owns pooling, sequence length, and device —
+Ollama runs the model itself, so it owns sequence length and device —
 those `EmbeddingCfg` knobs cannot reach it and are warned about at startup. The
 rest (prefixes, normalization, Matryoshka truncation) are plain text/vector math
 and are applied here, so they behave exactly as they do for sentence-transformers.
@@ -18,7 +18,7 @@ from graphrag.embeddings.base import Embedder
 log = get_logger(__name__)
 
 # Decided by the Ollama server; we can't influence them over the embed API.
-_SERVER_OWNED = ("pooling", "max_seq_length", "device")
+_SERVER_OWNED = ("max_seq_length", "device")
 
 
 class OllamaEmbedder(Embedder):

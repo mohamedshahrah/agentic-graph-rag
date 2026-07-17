@@ -35,8 +35,7 @@ embeddings:
   max_seq_length: 512
   query_prefix: ""            # e.g. "query: " for e5-style models
   document_prefix: ""
-  pooling: mean               # mean | cls | last_token  (sentence_transformers only)
-                              # note: pooling/max_seq_length/device are server-side
+                              # note: max_seq_length/device are server-side
                               # decisions under `ollama` and are ignored there
   cache:
     enabled: true             # cache vectors in Redis, keyed by (model, text)
@@ -61,8 +60,11 @@ ocr:
   # which silently misses any scan bearing a page label.
   min_text_chars: 100
   vision_llm:
-    provider: ollama          # ollama (gemma4) | gemini
-    model: gemma4:e4b         # swap to gemini-2.5-flash when provider=gemini
+    provider: ollama          # ollama (gemma3) | gemini
+    # gemma3:4b, NOT gemma4 — gemma4:e4b advertises `vision` in `ollama show`
+    # and then ignores attached images, which OCR cannot tell from a blank page.
+    # Swap to gemini-2.5-flash when provider=gemini.
+    model: gemma3:4b
     prompt: "Transcribe all text in this image exactly, preserving structure. Output only the text."
   tesseract:
     lang: eng
@@ -73,9 +75,12 @@ storage:
     provider: neo4j
     database: neo4j
   vector:
-    provider: neo4j           # store vectors on :Chunk nodes in Neo4j
+    provider: neo4j           # neo4j: vectors on :Chunk nodes, native ANN index
+                              # local: exact numpy search over files in local_dir
+                              #        (no service; fine to ~100k chunks/corpus)
     index_name: chunk_embeddings
     similarity: cosine
+    local_dir: data/vectors   # only used by provider: local
 
 # --- Retrieval ----------------------------------------------------------------
 retrieval:
@@ -113,11 +118,19 @@ agent:
 ingestion:
   extract_graph: true         # run LLM entity/relation extraction into the KG
                               # false -> vector-only RAG, dramatically faster ingest
-  max_concurrency: 4
+  max_concurrency: 4          # parallel extraction LLM calls per document
   # llm:                      # optional: dedicated extraction model (defaults to `llm`)
   #   provider: ollama        # extraction sees one chunk at a time, so it needs far
   #   model: gemma3:4b        # less context than chat — and on a small GPU, context
   #   extra: {num_ctx: 4096}  # size is what decides whether it fits in VRAM
+  resolve_entities:
+    enabled: true             # merge "Acme" / "Acme Robotics" style duplicates
+    similarity: 0.93          # name-embedding cosine needed for a merge
+  communities:
+    enabled: true             # cluster the graph + LLM-summarize each cluster;
+                              # powers the agent's `global_search` tool
+    max_communities: 12       # summarize at most this many (largest first)
+    min_size: 3               # ignore clusters smaller than this
 
 # --- Auth ---------------------------------------------------------------------
 auth:

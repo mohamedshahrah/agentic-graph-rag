@@ -15,6 +15,10 @@ class QueryService:
     def __init__(self, container: Container) -> None:
         self._c = container
 
+    @property
+    def settings(self):
+        return self._c.settings
+
     def _session(
         self, question: str, style: str | None, thread_id: str, user_id: str | None
     ) -> AgentSession:
@@ -31,7 +35,18 @@ class QueryService:
         thread_id: str = "default",
         user_id: str | None = None,
     ) -> QueryResult:
+        """Blocking — for the CLI and scripts (sync checkpointer)."""
         return self._session(question, style, thread_id, user_id).run()
+
+    async def aanswer(
+        self,
+        question: str,
+        style: str | None = None,
+        thread_id: str = "default",
+        user_id: str | None = None,
+    ) -> QueryResult:
+        """Async — the API's non-streaming path (async checkpointer)."""
+        return await self._session(question, style, thread_id, user_id).arun()
 
     async def stream(
         self,
@@ -39,10 +54,11 @@ class QueryService:
         style: str | None = None,
         thread_id: str = "default",
         user_id: str | None = None,
-    ) -> AsyncIterator[tuple[str, list[RetrievedChunk]]]:
+    ) -> AsyncIterator[tuple[str, str, list[RetrievedChunk]]]:
+        """Yield (kind, data, sources) — kind is "token" or "tool"."""
         session = self._session(question, style, thread_id, user_id)
-        async for token in session.astream_tokens():
-            yield token, session.sources
+        async for kind, data in session.astream_events():
+            yield kind, data, session.sources
 
     def search(self, query: str, k: int = 8, user_id: str | None = None) -> list[RetrievedChunk]:
         return self._c.tenant(user_id).hybrid_retriever.retrieve(query, k)

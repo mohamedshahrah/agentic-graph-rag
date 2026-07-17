@@ -19,3 +19,9 @@ class VectorStore(abc.ABC):
     @abc.abstractmethod
     def query(self, vector: list[float], k: int) -> list[RetrievedChunk]:
         ...
+
+    def delete_source(self, source: str) -> int:
+        """Drop every vector ingested from `source`. Backends whose vectors live
+        on the graph's chunk nodes are cleaned by GraphStore.delete_document and
+        can keep this no-op default."""
+        return 0

@@ -13,6 +13,7 @@ not N copies of the models.
 from __future__ import annotations
 
 import re
+import time
 from collections import OrderedDict
 from functools import cached_property
 
@@ -31,13 +32,16 @@ from graphrag.retrieval import (
     VectorRetriever,
     build_reranker,
 )
-from graphrag.storage.graph.neo4j_store import Neo4jGraphStore
+from graphrag.storage import build_graph_store, build_vector_store
 from graphrag.storage.neo4j_client import driver_from_secrets, safe_ident
-from graphrag.storage.vector.neo4j_vector import Neo4jVectorStore
 
 log = get_logger(__name__)
 
 _USER_RE = re.compile(r"[^a-z0-9_-]+")
+
+# When Redis is down, don't re-attempt a connection on every access — but do
+# recover without a restart once it's back.
+_REDIS_RETRY_SECONDS = 30.0
 
 
 def sanitize_user(user_id: str) -> str:
@@ -56,11 +60,8 @@ class Tenant:
         self.corpus = corpus
         self.database = database
 
-        self.graph_store = Neo4jGraphStore(c.driver, database, corpus)
-        self.vector_store = Neo4jVectorStore(
-            c.driver, database, corpus,
-            s.storage.vector.index_name, s.storage.vector.similarity,
-        )
+        self.graph_store = build_graph_store(c.driver, database, corpus, s)
+        self.vector_store = build_vector_store(c.driver, database, corpus, s)
         self.vector_retriever = VectorRetriever(c.embedder, self.vector_store)
         graph_aug = GraphAugmentedRetriever(self.graph_store, s.retrieval.graph_hops)
         self.hybrid_retriever = HybridRetriever(
@@ -69,9 +70,11 @@ class Tenant:
         )
         self.agent = AgentRunner(
             c.llm, self.vector_retriever, self.hybrid_retriever, self.graph_store,
+            c.embedder,
             checkpointer=c.checkpointer,
             top_k=s.retrieval.top_k, graph_hops=s.retrieval.graph_hops,
             default_style=s.agent.default_style,
+            max_tool_iterations=s.agent.max_tool_iterations,
         )
         self._embed_dim = c.embedder.dim
 
@@ -89,13 +92,28 @@ class Container:
         configure_logging(settings.app.log_level)
         self._tenants: OrderedDict[str, Tenant] = OrderedDict()
         self._ready_dbs: set[str] = set()
+        self._redis_client = None
+        self._redis_checked_at = 0.0
+        # The API flips this to True before serving so the checkpointer is built
+        # async (its streaming needs the async saver). CLI/scripts stay sync.
+        self.async_memory = False
 
     # -- shared infrastructure ------------------------------------------------
-    @cached_property
+    @property
     def redis(self):
+        """Shared Redis client, or None while unreachable. Reconnects lazily
+        (at most every _REDIS_RETRY_SECONDS) so a blip at startup doesn't
+        disable caching and quotas until the next restart."""
+        if self._redis_client is not None:
+            return self._redis_client
+        now = time.monotonic()
+        if now - self._redis_checked_at < _REDIS_RETRY_SECONDS:
+            return None
+        self._redis_checked_at = now
         try:
             client = get_redis(self.secrets.redis_url)
             client.ping()
+            self._redis_client = client
             return client
         except Exception:
             return None
@@ -106,7 +124,12 @@ class Container:
 
     @cached_property
     def checkpointer(self):
-        return build_checkpointer(self.secrets.redis_url, self.settings.agent.memory)
+        return build_checkpointer(
+            self.secrets.redis_url,
+            self.settings.agent.memory,
+            use_async=self.async_memory,
+            redis_available=self.redis is not None,
+        )
 
     # -- shared models (loaded once, reused by all tenants) -------------------
     @cached_property
@@ -139,6 +162,18 @@ class Container:
         )
 
     @cached_property
+    def extractor_llm(self):
+        """The chat model extraction (and community summarization) runs on —
+        the dedicated `ingestion.llm` when configured, else the main `llm`."""
+        cfg = self.settings.ingestion.llm
+        if cfg is None:
+            return self.llm
+        return build_chat_model(
+            cfg.provider, cfg.model, self.secrets,
+            temperature=cfg.temperature, max_tokens=cfg.max_tokens, extra=cfg.extra,
+        )
+
+    @cached_property
     def ocr(self):
         if not self.settings.ocr.enabled:
             return None
@@ -150,15 +185,7 @@ class Container:
 
     @cached_property
     def extractor(self) -> LLMGraphExtractor:
-        cfg = self.settings.ingestion.llm
-        if cfg is None:
-            return LLMGraphExtractor(self.llm)
-        return LLMGraphExtractor(
-            build_chat_model(
-                cfg.provider, cfg.model, self.secrets,
-                temperature=cfg.temperature, max_tokens=cfg.max_tokens, extra=cfg.extra,
-            )
-        )
+        return LLMGraphExtractor(self.extractor_llm)
 
     @cached_property
     def reranker(self):
@@ -182,6 +209,8 @@ class Container:
             log.warning("per_tenant_database_unavailable", database=database, error=str(exc))
 
     def tenant(self, user_id: str | None = None) -> Tenant:
+        if not self.settings.tenancy.enabled:
+            user_id = None  # single-tenant mode: everyone shares default_user
         user = sanitize_user(user_id or self.settings.tenancy.default_user)
         if user in self._tenants:
             self._tenants.move_to_end(user)

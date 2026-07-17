@@ -8,6 +8,8 @@ current user (API key when auth is on, else the X-User-Id header)."""
 
 from __future__ import annotations
 
+import urllib.parse
+import urllib.request
 import uuid
 from pathlib import Path
 
@@ -29,7 +31,20 @@ from graphrag.pipelines import IngestPipeline
 router = APIRouter(tags=["ingest"])
 log = get_logger(__name__)
 
-_UPLOAD_DIR = Path("data/uploads")
+# Server-side ingest is confined to this tree. Without the fence, any caller
+# could ingest an arbitrary server file (.env included) and read it back
+# through /search.
+_DATA_ROOT = Path("data")
+_UPLOAD_DIR = _DATA_ROOT / "uploads"
+_DOWNLOAD_DIR = _DATA_ROOT / "downloads"
+
+_URL_SUFFIX = {
+    "application/pdf": ".pdf",
+    "text/html": ".html",
+    "text/markdown": ".md",
+    "text/plain": ".txt",
+    "text/csv": ".csv",
+}
 
 
 def _inproc_ingest(container: Container, store: JobStore, job_id: str, path: str, user_id) -> None:
@@ -170,11 +185,39 @@ def delete_file(
     if source is None:
         raise HTTPException(status_code=404, detail=f"No such file: {file_id}")
 
-    removed = container.tenant(user_key).graph_store.delete_document(source)
+    tenant = container.tenant(user_key)
+    removed = tenant.graph_store.delete_document(source)
+    removed += tenant.vector_store.delete_source(source)  # no-op for Neo4j vectors
     Path(source).unlink(missing_ok=True)
     _release_file_slot(container, user_key, file_id)
     log.info("file_deleted", user=user_key, file=file_id, chunks=removed)
     return DeleteResponse(file_id=file_id, chunks_removed=removed)
+
+
+def _fetch_url(url: str, max_bytes: int) -> Path:
+    """Download a document into data/downloads with a size cap."""
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        raise HTTPException(status_code=400, detail="Only http(s) URLs can be ingested")
+    req = urllib.request.Request(url, headers={"User-Agent": "graphrag-ingest"})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:  # noqa: S310 — scheme checked
+            data = resp.read(max_bytes + 1)
+            ctype = (resp.headers.get("Content-Type") or "").split(";")[0].strip()
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Could not fetch URL: {exc}") from exc
+    if len(data) > max_bytes:
+        raise HTTPException(status_code=413, detail="Remote document exceeds the upload limit")
+
+    name = Path(parsed.path).name or "download"
+    if not Path(name).suffix:
+        name += _URL_SUFFIX.get(ctype, ".html" if "html" in ctype else ".txt")
+    dest = _DOWNLOAD_DIR / (uuid.uuid4().hex[:8] + "_" + name)
+    _DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    dest.write_bytes(data)
+    return dest
 
 
 @router.post("/ingest", response_model=IngestResponse)
@@ -186,9 +229,25 @@ async def ingest_path(
     store: JobStore = Depends(get_job_store),
     user: str | None = Depends(get_current_user),
 ) -> IngestResponse:
-    if not Path(path).exists():
+    """Ingest a server-side path under `data/`, or an http(s) URL."""
+    if path.startswith(("http://", "https://")):
+        max_bytes = container.settings.api.max_upload_mb * 1024 * 1024
+        dest = _fetch_url(path, max_bytes)
+        return await _enqueue(request, background, container, store, str(dest), user)
+
+    requested = Path(path)
+    try:
+        resolved = requested.resolve()
+        resolved.relative_to(_DATA_ROOT.resolve())
+    except ValueError:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Server-side ingest is restricted to {_DATA_ROOT}/ "
+                   "(upload the file, or pass an http(s) URL)",
+        ) from None
+    if not resolved.exists():
         raise HTTPException(status_code=404, detail=f"Path not found: {path}")
-    return await _enqueue(request, background, container, store, path, user)
+    return await _enqueue(request, background, container, store, str(resolved), user)
 
 
 @router.get("/ingest/{job_id}", response_model=IngestStatus)

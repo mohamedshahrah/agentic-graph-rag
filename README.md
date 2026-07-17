@@ -36,10 +36,11 @@ not a fixed pipeline, it *reasons about how to retrieve*.
 
 ```
 file ──▶ load ──▶ chunk ──▶ embed ──▶ vector index
-   (PDF/text/image)   │                     │
-                      └──▶ LLM extracts ──▶ knowledge graph
-                           entities +       (entities linked to
-                           relationships     the chunks that mention them)
+   (PDF/Word/    │                        │
+    HTML/CSV/    └──▶ LLM extracts ──▶ knowledge graph ──▶ resolve duplicates
+    text/image)       entities +       (entities linked to      + summarize
+                      relationships     the chunks that           communities
+                                        mention them)
 ```
 
 Images and scanned PDFs are read by a small vision model (**OCR**) before
@@ -48,18 +49,27 @@ its text layer is thinner than `ocr.min_text_chars` — not merely when it's emp
 because scans usually carry a page number or a scanner header, and "has some
 text" is not "was read".
 
+After a document lands, two enrichment passes run: **entity resolution** folds
+duplicates the per-chunk extractor couldn't see were the same thing ("Acme" and
+"Acme Robotics"), and **community summaries** cluster the graph and describe each
+cluster, so the agent can answer whole-corpus questions, not just chunk lookups.
+
 **Answering a question:**
 
 ```
 question ──▶ agent ──▶ picks tool(s) ──▶ hybrid retrieval ──▶ rerank ──▶ answer + sources
                         │                 (vector ⊕ graph ⊕ keyword,
-                        │                  fused with RRF)
-                        └── graph_neighbors, compare, get_entity, ...
+                        │                  run in parallel, fused with RRF)
+                        └── graph_neighbors, expand_subgraph, compare,
+                            get_entity, global_search, ...
 ```
 
 The agent cites the exact chunks it used. Answers come in a **style** you choose
-(concise / detailed / technical / ELI5), and it can **compare** several subjects
-side by side.
+(concise / detailed / technical / ELI5), it can **compare** several subjects side
+by side, and for corpus-wide questions ("what are the main themes?") it reads the
+**community summaries** instead of hunting for a single passage. The three legs of
+hybrid retrieval run concurrently, and the UI shows which tool the agent is
+running while you wait.
 
 For the full picture, see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
@@ -129,7 +139,7 @@ You need a Neo4j and a Redis reachable from your machine (local installs, cloud,
 or `docker compose up neo4j redis`).
 
 ```bash
-pip install -e ".[dev]"
+pip install -e ".[dev,extras]"   # extras = Voyage/Cohere providers the api profile uses
 cp .env.example .env          # point GRAPHRAG_NEO4J_* / GRAPHRAG_REDIS_URL at your services
 make serve PROFILE=api        # uvicorn on :8000, docs at /docs
 graphrag ingest data/sample.md
@@ -148,16 +158,18 @@ adding users costs almost no extra memory. See
 
 | Method | Path | What it does |
 | --- | --- | --- |
-| `POST` | `/users` · `GET` `/users` | Create / list users (isolated namespaces). |
+| `POST` | `/users` · `GET` `/users` | Create / list users (isolated namespaces). Admin-gated when auth is on. |
+| `DELETE` | `/users/{id}/keys` | Revoke every API key a user holds (data stays). |
 | `POST` | `/query` | Ask a question. Streams the answer (SSE) by default; returns sources used. |
 | `POST` | `/compare` | Side-by-side comparison of several subjects. |
 | `POST` | `/search` | Raw hybrid retrieval, no LLM — see exactly what the retriever returns. |
-| `POST` | `/ingest` | Ingest a server-side path (background job). |
+| `POST` | `/ingest` | Ingest a server-side path (under `data/`) **or an http(s) URL** (background job). |
 | `POST` | `/ingest/upload` | Upload and ingest a file. |
 | `GET`  | `/ingest/{job_id}` | Check ingest progress. |
 | `GET`  | `/ingest/files` | List your uploaded files and slots used. |
 | `DELETE` | `/ingest/files/{file_id}` | Delete a file, its chunks and orphaned entities, and free its slot. |
-| `GET`  | `/health` · `/ready` | Liveness / readiness. |
+| `GET`  | `/usage` | Per-user token usage (admin-gated). |
+| `GET`  | `/health` · `/ready` · `/metrics` | Liveness / readiness / Prometheus metrics. |
 
 Every endpoint is testable interactively at **`/docs`** — that page is generated
 by FastAPI, so "write and test a request" needs no extra tool.
@@ -313,12 +325,13 @@ src/graphrag/
 │   └── tesseract.py  Offline fallback, no model needed
 │
 ├── ingestion/      The ingest half, in pipeline order
-│   ├── loaders/      PDF · text · image ──▶ Document (OCR when a page is a scan)
+│   ├── loaders/      PDF · Word · HTML · CSV · text · image ──▶ Document (OCR on scans)
 │   ├── chunking/     Document ──▶ Chunks. Three strategies:
 │   │                   token     fixed windows, exact
 │   │                   recursive split on structure, then size  (default)
 │   │                   semantic  split where meaning shifts (uses the embedder)
-│   └── extraction/   Chunk ──▶ Entities + Relations, via an LLM
+│   ├── extraction/   Chunk ──▶ Entities + Relations, via an LLM
+│   └── enrich.py     Post-ingest: entity resolution + community summaries
 │
 ├── embeddings/     Text ──▶ vectors. One `Embedder` interface, several backends
 │   ├── ollama.py     Reuses a model you've pulled (no weights downloaded)
@@ -337,25 +350,29 @@ src/graphrag/
 │
 ├── agent/          Decides HOW to retrieve — this is the "agentic" part
 │   ├── graph.py      LangGraph loop: think ──▶ call tool ──▶ look ──▶ repeat
-│   ├── tools.py      What the agent may call: vector_search, graph_neighbors, …
+│   │                   (run/arun/astream_events — sync CLI, async API, streaming)
+│   ├── tools.py      What the agent may call: hybrid_search, graph_neighbors,
+│   │                   global_search, …
 │   ├── prompts.py    System prompts that steer the loop
 │   └── styles.py     concise / detailed / technical / eli5
 │
 ├── ─────────────── PLUMBING ────────────────────────────────────────────
 │
 ├── llm/factory.py  One function ──▶ a chat model for any provider
-├── storage/        GraphStore + VectorStore interfaces ──▶ Neo4j adapter
+├── storage/        GraphStore + VectorStore interfaces ──▶ Neo4j | local adapters
+│   └── vector/       neo4j_vector (native index) · local_store (numpy files)
 ├── pipelines/      Wires the above into `ingest` and `query` flows
 ├── jobs.py         Ingest job status, persisted in Redis
 ├── worker.py       Arq worker — runs ingest off the API process
 ├── auth.py         API keys (SHA-256 hashed) — the key identifies the user
 ├── __main__.py     The `graphrag` CLI
-├── api/            FastAPI: routers · SSE streaming · deps
+├── api/            FastAPI: routers · SSE streaming · deps · /metrics
 └── container.py    Composition root: reads config, builds everything, once
 
-frontend/           React + Vite chat UI, served by nginx (own container)
+frontend/           React + Vite chat UI (threads, upload, sources), nginx
 configs/            The YAML profiles — default · local · api · local-gemma
 docker/             API image + Caddy reverse-proxy config
+scripts/eval.py     Score retrieval + answers against data/eval/qa.yaml (make eval)
 tests/unit/         Fast, no services needed. Start here to learn the codebase.
 ```
 
@@ -432,24 +449,40 @@ This is built to run as a controllable service, not just a demo. What's in place
   it falls back to in-process tasks so single-container dev still works.
 - **Durable agent memory.** Conversation memory uses a Redis-backed LangGraph
   checkpointer, so multi-turn context survives restarts and is shared across API
-  replicas (falls back to in-process memory if unavailable).
+  replicas. The API uses the async saver (its streaming needs it), the CLI the
+  sync one — same keyspace, so both see the same threads. A Redis that's actually
+  unreachable (not just a missing package) degrades to in-process memory instead
+  of failing every query.
 - **Resource controls.** Every container has RAM/CPU caps (`.env`:
   `API_MEM_LIMIT`, `WORKER_MEM_LIMIT`, `NEO4J_MEM_LIMIT`, `NEO4J_HEAP`, …), plus
   CPU-thread caps (`OMP_NUM_THREADS`) and worker concurrency
   (`GRAPHRAG_WORKER_CONCURRENCY`) so local models can't starve the host.
 - **Limits.** Per-user file cap (**10 files**, `api.max_files_per_user`), upload
-  size cap (`api.max_upload_mb`), and per-user **rate limiting**
-  (`api.rate_limit`, keyed by `X-User-Id` / IP). CORS is restricted to configured
-  origins/methods/headers, and the API warns on a default Neo4j password. The
-  file cap counts what you currently store, not what you have ever uploaded —
-  `DELETE /ingest/files/{id}` frees a slot. Raising `max_upload_mb` also needs
-  `MAX_UPLOAD_MB` in `.env` raised (nginx rejects oversized bodies before the API
-  sees them, and its own default is 1 MB).
+  size cap (`api.max_upload_mb`), and per-user **rate limiting** (`api.rate_limit`;
+  keyed by the *verified* user when auth is on, IP otherwise — never a spoofable
+  header, and Redis-backed so limits hold across replicas). CORS is restricted to
+  configured origins/methods/headers, and the API warns on a default Neo4j
+  password. The file cap counts what you currently store, not what you have ever
+  uploaded — `DELETE /ingest/files/{id}` frees a slot. Raising `max_upload_mb`
+  also needs `MAX_UPLOAD_MB` in `.env` raised (nginx rejects oversized bodies
+  before the API sees them, and its own default is 1 MB).
+- **Confined server-side ingest.** `POST /ingest` with a path is fenced to
+  `data/` (an attempt to reach `.env` or any other server file is a 400), and it
+  also accepts an http(s) URL, fetched with a size cap. Uploads go through
+  `/ingest/upload` regardless.
 - **API-key authentication.** Set `auth.enabled: true` and requests must carry a
   valid key (`Authorization: Bearer <key>`); the verified key determines the user,
   so tenant identity is trustworthy (not a spoofable header). Keys are stored only
-  as SHA-256 hashes. Mint one with `graphrag apikey <user>` or `POST /users`
-  (gated by `GRAPHRAG_ADMIN_KEY` when set). Off by default for local dev.
+  as SHA-256 hashes. User management **fails closed**: with auth on and no
+  `GRAPHRAG_ADMIN_KEY` set, `POST /users` is *locked*, not open — otherwise anyone
+  could mint themselves a key. Mint one with `graphrag apikey <user>` or (admin)
+  `POST /users`; revoke a leaked one with `graphrag revoke <user>` or
+  `DELETE /users/{id}/keys`. Off by default for local dev.
+- **Observability.** Prometheus metrics at `/metrics` (request counts + latency
+  histograms, labeled by route template so cardinality stays bounded), and
+  approximate per-user token usage at `/usage`. A `make eval` target scores
+  retrieval and answers against a golden set (`data/eval/qa.yaml`) so retrieval
+  changes are measured, not guessed.
 - **TLS + reverse proxy.** A **Caddy** proxy is the public entrypoint (80/443):
   it terminates TLS, routes `/api/*` → API and everything else → the UI (and
   streams SSE). Behind it the UI and API share one origin, so CORS isn't needed.
@@ -470,15 +503,18 @@ cert on :443 and redirects HTTP→HTTPS. For a real deployment, also remove the
 host `ports` from the `api`/`frontend` services so only the proxy is reachable.
 
 Still on the roadmap before untrusted-internet exposure: per-tenant vector
-isolation at scale (Enterprise DB-per-user), backups, and metrics/tracing.
-Vector-quantization opportunities (e.g. TurboQuant) are noted in
+isolation at scale (Enterprise DB-per-user), backups, and distributed tracing.
+Metrics are now exported at `/metrics`; the `local` vector provider (exact numpy
+search, no service) is a first step toward the quantized ANN backends —
+TurboQuant and friends — sketched in
 [`docs/OPTIMIZATION-NOTES.md`](docs/OPTIMIZATION-NOTES.md).
 
 ## Development
 
 ```bash
 make install     # editable install with dev + extra providers
-make test        # unit tests
+make test        # unit tests (fast, no services)
+make eval        # score retrieval + answers vs the golden set (needs the stack up)
 make lint        # ruff + mypy
 make fmt         # auto-format
 ```

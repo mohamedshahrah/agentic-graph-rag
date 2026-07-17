@@ -16,6 +16,9 @@ name: agentic-graph-rag
 services:
   neo4j:
     image: neo4j:5.23
+    # Come back after a Docker Desktop / host restart. `unless-stopped` (not
+    # `always`) so an explicit `docker compose stop|down` stays stopped.
+    restart: unless-stopped
     environment:
       NEO4J_AUTH: neo4j/${GRAPHRAG_NEO4J_PASSWORD:-12345678}
       NEO4J_PLUGINS: '["apoc"]'
@@ -35,8 +38,18 @@ services:
       retries: 20
 
   redis:
-    image: redis:7-alpine
-    command: ["redis-server", "--maxmemory", "${REDIS_MAXMEMORY:-384mb}", "--maxmemory-policy", "allkeys-lru"]
+    # redis-stack-server, NOT plain redis: the LangGraph Redis checkpointer that
+    # backs durable agent memory needs the RediSearch/RedisJSON modules — it
+    # issues FT.* commands. Vanilla redis answers "unknown command 'FT._LIST'"
+    # and memory silently falls back to in-process. (This mismatch is also what
+    # writes an RDB a plain `redis:7-alpine` then can't reload — the modules'
+    # newer core bumps the RDB version.)
+    image: redis/redis-stack-server:7.4.0-v3
+    restart: unless-stopped
+    # maxmemory via REDIS_ARGS, not a `command:` override — overriding the
+    # command bypasses the entrypoint that loads the modules.
+    environment:
+      REDIS_ARGS: "--maxmemory ${REDIS_MAXMEMORY:-384mb} --maxmemory-policy allkeys-lru"
     ports: ["6379:6379"]
     volumes: ["redis_data:/data"]
     deploy:
@@ -50,15 +63,23 @@ services:
 
   api:
     build: { context: ., dockerfile: docker/Dockerfile }
+    restart: unless-stopped
     env_file: [.env]
     environment: &backend_env
       GRAPHRAG_PROFILE: ${GRAPHRAG_PROFILE:-local}
       GRAPHRAG_NEO4J_URI: bolt://neo4j:7687
       GRAPHRAG_REDIS_URL: redis://redis:6379/0
-      GRAPHRAG_OLLAMA_BASE_URL: http://ollama:11434
+      # Defaults to the Ollama on the *host* (reusing models you've pulled).
+      # Running the bundled service instead? set
+      # GRAPHRAG_OLLAMA_BASE_URL_INTERNAL=http://ollama:11434 in .env.
+      GRAPHRAG_OLLAMA_BASE_URL: ${GRAPHRAG_OLLAMA_BASE_URL_INTERNAL:-http://host.docker.internal:11434}
       # Cap CPU-thread fan-out so limits are actually respected.
       OMP_NUM_THREADS: ${OMP_NUM_THREADS:-2}
       TOKENIZERS_PARALLELISM: "false"
+    extra_hosts: &host_gateway
+      # On Linux, host.docker.internal doesn't exist unless mapped explicitly
+      # (Docker Desktop provides it; plain dockerd does not).
+      - "host.docker.internal:host-gateway"
     ports: ["8000:8000"]
     depends_on:
       neo4j: { condition: service_healthy }
@@ -76,11 +97,22 @@ services:
 
   worker:
     build: { context: ., dockerfile: docker/Dockerfile }
+    restart: unless-stopped
     command: ["arq", "graphrag.worker.WorkerSettings"]
     env_file: [.env]
     environment:
       <<: *backend_env
       GRAPHRAG_WORKER_CONCURRENCY: ${GRAPHRAG_WORKER_CONCURRENCY:-2}
+    extra_hosts: *host_gateway
+    # The shared image's HEALTHCHECK curls :8000/health, but the worker runs arq,
+    # not the web server — inheriting it would flap to "unhealthy" forever. Check
+    # what the worker actually depends on instead: a reachable Redis queue.
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os,redis; redis.Redis.from_url(os.environ['GRAPHRAG_REDIS_URL']).ping()"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
     depends_on:
       neo4j: { condition: service_healthy }
       redis: { condition: service_healthy }
@@ -91,6 +123,7 @@ services:
 
   frontend:
     build: { context: ./frontend }
+    restart: unless-stopped
     ports: ["5173:80"]
     depends_on:
       api: { condition: service_healthy }
@@ -100,6 +133,7 @@ services:
 
   ollama:
     image: ollama/ollama:latest
+    restart: unless-stopped
     profiles: ["local"]
     ports: ["11434:11434"]
     volumes: ["ollama_data:/root/.ollama"]
@@ -112,6 +146,7 @@ services:
   # only the proxy is reachable from outside.
   proxy:
     image: caddy:2-alpine
+    restart: unless-stopped
     environment:
       SITE_ADDRESS: ${SITE_ADDRESS:-:80}   # -> localhost or a domain to enable HTTPS
       TLS_EMAIL: ${TLS_EMAIL:-}

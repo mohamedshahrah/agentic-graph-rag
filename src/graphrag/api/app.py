@@ -10,8 +10,9 @@ import time
 import uuid
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
+from prometheus_client import CONTENT_TYPE_LATEST, Counter, Histogram, generate_latest
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
@@ -26,14 +27,34 @@ from graphrag.pipelines import QueryService
 
 log = get_logger(__name__)
 
+_REQUESTS = Counter(
+    "graphrag_requests_total", "HTTP requests", ["method", "path", "status"]
+)
+_LATENCY = Histogram(
+    "graphrag_request_seconds", "HTTP request latency", ["method", "path"],
+    buckets=(0.05, 0.25, 1, 5, 15, 60, 180),
+)
+
 
 def _rate_key(request: Request) -> str:
-    # Rate-limit per user, falling back to client IP for unauthenticated calls.
+    """Rate-limit bucket key. With auth on, the bucket is the *verified* user —
+    never a header the caller invents, which would let one client mint a fresh
+    bucket per request. Dev mode trusts X-User-Id (that's what it's for)."""
+    container: Container = request.app.state.container
+    if container.settings.auth.enabled:
+        from graphrag.api.deps import extract_key
+
+        key = extract_key(request)
+        if key:
+            user = request.app.state.key_store.resolve(key)
+            if user:
+                return f"user:{user}"
+        return get_remote_address(request)
     return request.headers.get("X-User-Id") or get_remote_address(request)
 
 
-# Health/readiness polls every few seconds and would bury everything else.
-_QUIET_PATHS = {"/health", "/ready"}
+# Health/readiness/metrics poll every few seconds and would bury everything else.
+_QUIET_PATHS = {"/health", "/ready", "/metrics"}
 
 
 async def _log_requests(request: Request, call_next):
@@ -68,15 +89,27 @@ async def _log_requests(request: Request, call_next):
             error=str(exc) or type(exc).__name__,
             seconds=round(time.perf_counter() - started, 2),
         )
+        _observe(request, 500, time.perf_counter() - started)
         raise
+    elapsed = time.perf_counter() - started
+    _observe(request, response.status_code, elapsed)
     log.info(
         "request_done",
         rid=rid,
         path=request.url.path,
         status=response.status_code,
-        seconds=round(time.perf_counter() - started, 2),
+        seconds=round(elapsed, 2),
     )
     return response
+
+
+def _observe(request: Request, status: int, seconds: float) -> None:
+    # The route *template* (/ingest/{job_id}), not the raw path — raw paths are
+    # unbounded label cardinality, which is how Prometheus dies.
+    route = request.scope.get("route")
+    path = getattr(route, "path", request.url.path)
+    _REQUESTS.labels(request.method, path, str(status)).inc()
+    _LATENCY.labels(request.method, path).observe(seconds)
 
 
 @asynccontextmanager
@@ -86,23 +119,28 @@ async def _lifespan(app: FastAPI):
     if container.secrets.neo4j_password in ("please-change-me", ""):
         log.warning("weak_neo4j_password", hint="set GRAPHRAG_NEO4J_PASSWORD in .env")
 
-    try:
-        container.setup_storage()
-        log.info("storage_ready", corpus=container.settings.tenancy.default_user)
-    except Exception as exc:  # don't crash the API if Neo4j is briefly down
-        log.warning("storage_setup_deferred", error=str(exc))
-
     # The Redis checkpointer is async and has to be initialized on the loop that
-    # serves requests — here, not at construction time. It backs both /query
-    # paths: the sync one refuses to run until this has happened, and streaming
-    # needs its async half. Do it before any request can arrive.
+    # serves requests — here, not at construction time. Do it *before* the first
+    # tenant is built: if it fails, we swap in in-process memory, and tenants
+    # created after this point pick the working saver up.
     asetup = getattr(container.checkpointer, "asetup", None)
     if asetup is not None:
         try:
             await asetup()
             log.info("agent_memory_ready", backend="redis")
         except Exception as exc:
-            log.warning("agent_memory_setup_failed", error=str(exc))
+            log.warning(
+                "agent_memory_setup_failed", error=str(exc), fallback="in-process"
+            )
+            from langgraph.checkpoint.memory import MemorySaver
+
+            container.checkpointer = MemorySaver()
+
+    try:
+        container.setup_storage()
+        log.info("storage_ready", corpus=container.settings.tenancy.default_user)
+    except Exception as exc:  # don't crash the API if Neo4j is briefly down
+        log.warning("storage_setup_deferred", error=str(exc))
 
     # Connect to the ingest queue; fall back to in-process tasks if unavailable.
     app.state.arq = None
@@ -123,6 +161,9 @@ async def _lifespan(app: FastAPI):
 
 def create_app(container: Container | None = None) -> FastAPI:
     container = container or Container()
+    # Must be set before anything touches `container.checkpointer`: the API
+    # streams over `astream`, which needs the async saver flavor.
+    container.async_memory = True
 
     app = FastAPI(
         title="Agentic Graph RAG",
@@ -137,10 +178,20 @@ def create_app(container: Container | None = None) -> FastAPI:
     app.state.users = {container.settings.tenancy.default_user}
     if container.settings.auth.enabled:
         log.info("auth_enabled", note="API key required (Authorization: Bearer)")
+        if not container.secrets.admin_api_key:
+            log.warning(
+                "admin_key_missing",
+                note="auth is on but GRAPHRAG_ADMIN_KEY is unset — "
+                     "user creation is locked until it is configured",
+            )
 
-    # Rate limiting (per user / IP).
+    # Rate limiting (per verified user / IP). Redis-backed when available so
+    # limits hold across API replicas; in-memory otherwise.
+    storage_uri = container.secrets.redis_url if container.redis is not None else "memory://"
     app.state.limiter = Limiter(
-        key_func=_rate_key, default_limits=[container.settings.api.rate_limit]
+        key_func=_rate_key,
+        default_limits=[container.settings.api.rate_limit],
+        storage_uri=storage_uri,
     )
     app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
     app.add_middleware(SlowAPIMiddleware)
@@ -152,6 +203,10 @@ def create_app(container: Container | None = None) -> FastAPI:
         allow_methods=container.settings.api.cors_methods,
         allow_headers=container.settings.api.cors_headers,
     )
+
+    @app.get("/metrics", include_in_schema=False)
+    def metrics() -> Response:
+        return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
     from graphrag.api.routers import health, ingest, query, search, users
 

@@ -16,11 +16,13 @@ WORKDIR /app
 COPY pyproject.toml README.md ./
 COPY src ./src
 
-# Optional extras, e.g. --build-arg EXTRAS='[local-models]' to run the embedder
-# and cross-encoder reranker in-process. That pulls torch plus ~2.7 GB of CUDA
-# libraries this container has no GPU to use, so it's off by default; the
-# `local` profile serves both roles from Ollama instead.
-ARG EXTRAS=""
+# `[extras]` ships the API embedders/rerankers (Voyage, Cohere) the `api`
+# profile selects — without them that profile cannot embed or rerank at all.
+# They're small. What stays opt-in is `[local-models]` (torch, ~3.9 GB of it
+# CUDA libraries this container has no GPU for): add it via
+# --build-arg EXTRAS='[extras,local-models]' if you want the in-process
+# embedder/cross-encoder; the `local` profile serves both roles from Ollama.
+ARG EXTRAS="[extras]"
 RUN pip install ".${EXTRAS}"
 
 COPY configs ./configs

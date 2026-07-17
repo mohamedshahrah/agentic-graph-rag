@@ -5,7 +5,8 @@
 llm:
   provider: anthropic
   model: claude-opus-4-8
-  temperature: 0.1
+  # No `temperature` here: the Anthropic API rejects temperature modifications
+  # while thinking is enabled (the factory forces 1 in that case anyway).
   max_tokens: 4096
   # Claude 4.x uses adaptive thinking; this passes through to ChatAnthropic.
   extra:

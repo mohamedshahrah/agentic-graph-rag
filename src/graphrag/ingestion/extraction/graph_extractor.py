@@ -54,6 +54,19 @@ def _is_nameable(name: str) -> bool:
     return bool(_HAS_LETTER.search(n))  # drops "$", "11", "0140...", "->"
 
 
+_TYPE_CLEAN = re.compile(r"[^A-Za-z0-9]+")
+
+
+def _rel_type(raw: str) -> str:
+    """Normalize an LLM-emitted relation type to UPPER_SNAKE. The type is
+    interpolated into the graph as a relationship *type* (via APOC), so free
+    text here becomes schema noise at best — bound it hard."""
+    cleaned = _TYPE_CLEAN.sub("_", (raw or "").strip()).strip("_").upper()[:40]
+    if not cleaned or not cleaned[0].isalpha():
+        return "RELATED_TO"
+    return cleaned
+
+
 class LLMGraphExtractor:
     def __init__(self, llm: BaseChatModel) -> None:
         self._llm = llm
@@ -81,7 +94,7 @@ class LLMGraphExtractor:
             Relation(
                 source=r["source"],
                 target=r["target"],
-                type=r.get("type", "RELATED_TO"),
+                type=_rel_type(r.get("type", "RELATED_TO")),
                 description=r.get("description", ""),
             )
             for r in data.get("relations", [])

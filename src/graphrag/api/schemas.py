@@ -27,7 +27,8 @@ class QueryRequest(BaseModel):
     question: str = Field(..., min_length=1)
     style: str = Field("detailed", description="concise | detailed | technical | eli5")
     thread_id: str = Field("default", description="conversation id for multi-turn memory")
-    stream: bool = True
+    # None -> the server default (api.stream in config) decides.
+    stream: bool | None = None
 
 
 class ToolCall(BaseModel):
@@ -104,6 +105,16 @@ class UserCreated(BaseModel):
 
 class UsersList(BaseModel):
     users: list[str] = []
+
+
+class KeysRevoked(BaseModel):
+    user_id: str
+    revoked: int
+
+
+class UsageReport(BaseModel):
+    # user id -> streamed answer tokens (approximate; counted per SSE chunk)
+    tokens: dict[str, int] = {}
 
 
 class Health(BaseModel):

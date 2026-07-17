@@ -39,6 +39,10 @@ def build_chat_model(
         if provider == "anthropic":
             from langchain_anthropic import ChatAnthropic
 
+            # The Anthropic API rejects temperature modifications when extended
+            # thinking is on — a configured temperature would 400 every request.
+            if "thinking" in extra:
+                temperature = 1
             return ChatAnthropic(
                 model=model,
                 api_key=secrets.anthropic_api_key,

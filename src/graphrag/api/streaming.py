@@ -1,8 +1,10 @@
-"""Server-Sent Events for streaming answers. The client receives incremental
-`token` events, then one `sources` event, then `done`."""
+"""Server-Sent Events for streaming answers. The client receives `tool` events
+as the agent picks retrieval strategies, incremental `token` events, then one
+`sources` event, then `done`."""
 
 from __future__ import annotations
 
+import contextlib
 import json
 import time
 from collections.abc import AsyncIterator
@@ -14,8 +16,21 @@ from graphrag.pipelines import QueryService
 log = get_logger(__name__)
 
 
+def record_usage(redis_client, user_id: str | None, tokens: int) -> None:
+    """Best-effort per-user token accounting (streamed chunks ≈ tokens)."""
+    if redis_client is None or tokens <= 0:
+        return
+    with contextlib.suppress(Exception):
+        redis_client.hincrby("graphrag:usage:tokens", user_id or "default", tokens)
+
+
 async def sse_answer(
-    service: QueryService, question: str, style: str, thread_id: str, user_id: str | None = None
+    service: QueryService,
+    question: str,
+    style: str,
+    thread_id: str,
+    user_id: str | None = None,
+    redis_client=None,
 ) -> AsyncIterator[dict]:
     sources = []
     started = time.perf_counter()
@@ -23,9 +38,15 @@ async def sse_answer(
     first_token_at: float | None = None
     log.info("stream_started", question=question[:80], style=style, user=user_id or "-")
     try:
-        async for token, srcs in service.stream(
+        async for kind, data, srcs in service.stream(
             question, style=style, thread_id=thread_id, user_id=user_id
         ):
+            sources = srcs
+            if kind == "tool":
+                # Lets the UI say "searching the graph…" instead of sitting
+                # silent through the retrieval phase.
+                yield {"event": "tool", "data": data}
+                continue
             if first_token_at is None:
                 # The gap before this is the agent retrieving and calling tools —
                 # the window where the UI looks hung. Worth seeing separately from
@@ -33,10 +54,10 @@ async def sse_answer(
                 first_token_at = time.perf_counter() - started
                 log.info("stream_first_token", seconds=round(first_token_at, 1))
             tokens += 1
-            sources = srcs
-            yield {"event": "token", "data": token}
+            yield {"event": "token", "data": data}
         payload = [Source.from_chunk(c).model_dump() for c in sources]
         yield {"event": "sources", "data": json.dumps(payload)}
+        record_usage(redis_client, user_id, tokens)
         log.info(
             "stream_done",
             tokens=tokens,

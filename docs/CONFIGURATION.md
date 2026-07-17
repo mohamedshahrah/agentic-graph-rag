@@ -31,12 +31,10 @@ The embedding block exposes fine-grained control:
 | `max_seq_length` | Max tokens per chunk the embedder will read |
 | `query_prefix`   | Prepended to queries (e.g. `"query: "` for e5 models) |
 | `document_prefix`| Prepended to documents |
-| `pooling`        | `mean` / `cls` / `last_token` (sentence-transformers) |
 | `cache.enabled`  | Cache vectors in Redis, keyed by `(model, text)` |
 
-Under `provider: ollama` the server owns `pooling`, `max_seq_length`, and
-`device` — setting them logs a warning and changes nothing. Every other key still
-applies.
+Under `provider: ollama` the server owns `max_seq_length` and `device` — setting
+them logs a warning and changes nothing. Every other key still applies.
 
 ## Chunking
 
@@ -87,13 +85,31 @@ must resist naming things that only mean something inside the document (state
 labels, variables, grammar symbols). Small models often can't, and fill the graph
 with entities like `Q0`..`Q16`. If graph expansion looks noisy, that's the knob.
 
+`ingestion.max_concurrency` is how many extraction LLM calls run in parallel per
+document (extraction is the slow part of ingest; the writes stay serial).
+
+Two post-ingest passes run automatically and can be tuned or disabled:
+
+- **`ingestion.resolve_entities`** merges entities that name the same thing —
+  "Acme" and "Acme Robotics" — which the per-chunk extractor can't see. It uses
+  token containment plus name-embedding similarity (`similarity`, default 0.93),
+  deliberately conservative because a wrong merge is worse than a missed one.
+- **`ingestion.communities`** clusters the entity graph and LLM-summarizes each
+  cluster (`max_communities`, `min_size`). Those summaries back the agent's
+  `global_search` tool, which answers whole-corpus questions ("what are the main
+  themes?") that no single chunk can. Both rebuild at the end of each ingest.
+
 ## Storage & retrieval
 
-`storage.graph` / `storage.vector` select the backend (Neo4j by default).
+`storage.graph` / `storage.vector` select the backend. `storage.vector.provider`
+is `neo4j` (vectors on `:Chunk` nodes, native ANN index) or `local` (exact numpy
+search over files under `local_dir` — no service, fine to ~100k chunks per
+corpus; chunk nodes still live in Neo4j for fulltext + graph edges).
 `retrieval.top_k` is how many chunks reach the LLM; `candidate_k` is how many are
-fetched before reranking; `graph_hops` bounds graph traversal; `rerank` picks the
-reranker (`ollama` / any chat model, `cross_encoder` local, or `cohere` /
-`voyage`). See [`PROVIDERS.md`](PROVIDERS.md) for the trade-offs.
+fetched before reranking; `graph_hops` bounds graph traversal *and* how far
+graph-augmented retrieval follows relationships out from matched entities;
+`rerank` picks the reranker (`ollama` / any chat model, `cross_encoder` local, or
+`cohere` / `voyage`). See [`PROVIDERS.md`](PROVIDERS.md) for the trade-offs.
 
 ## Authentication (`auth`)
 
@@ -104,8 +120,12 @@ Off by default (dev). Turn on with `auth.enabled: true`:
   so tenant identity can't be spoofed.
 - Keys are stored only as SHA-256 hashes (in Redis). They're shown **once** at
   creation.
-- Mint keys with `graphrag apikey <user>` or `POST /users`. Set
-  `GRAPHRAG_ADMIN_KEY` in `.env` to require `X-Admin-Key` for user creation.
+- Mint keys with `graphrag apikey <user>` or (admin) `POST /users`; revoke every
+  key a user holds with `graphrag revoke <user>` or `DELETE /users/{id}/keys`.
+- User management is admin-gated and **fails closed**: with auth on you must set
+  `GRAPHRAG_ADMIN_KEY` in `.env` and send it as `X-Admin-Key`. Without the key
+  configured, `POST /users` / `GET /users` are locked — otherwise anyone could
+  create a user and mint themselves a valid key.
 
 ## Limits & resources
 

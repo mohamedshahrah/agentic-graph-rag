@@ -3,11 +3,23 @@ database as the graph means one hop to go from a matched chunk to its entities."
 
 from __future__ import annotations
 
+import json
+
 from graphrag.core.types import Chunk, RetrievedChunk
 from graphrag.storage.neo4j_client import safe_ident
 from graphrag.storage.vector.base import VectorStore
 
 _SIM = {"cosine": "cosine", "euclidean": "euclidean"}
+
+
+def _meta(raw) -> dict:
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+        return parsed if isinstance(parsed, dict) else {}
+    except (TypeError, ValueError):
+        return {}
 
 
 class Neo4jVectorStore(VectorStore):
@@ -45,16 +57,20 @@ class Neo4jVectorStore(VectorStore):
                 "text": c.text,
                 "source": c.source,
                 "embedding": c.embedding,
+                "metadata": json.dumps(c.metadata or {}),
             }
             for c in chunks
             if c.embedding is not None
         ]
         self._run(
+            # (corpus, id) — never bare id: two tenants ingesting the same file
+            # produce identical chunk ids, and a bare-id MERGE would hand one
+            # tenant's node to the other.
             """
             UNWIND $rows AS row
-            MERGE (c:Chunk {id: row.id})
+            MERGE (c:Chunk {corpus: $corpus, id: row.id})
             SET c.text = row.text, c.source = row.source, c.doc_id = row.doc_id,
-                c.corpus = $corpus, c.embedding = row.embedding
+                c.embedding = row.embedding, c.metadata = row.metadata
             """,
             rows=rows,
         )
@@ -66,7 +82,8 @@ class Neo4jVectorStore(VectorStore):
             CALL db.index.vector.queryNodes('{self._index}', $fetch, $vector)
             YIELD node, score
             WHERE node.corpus = $corpus
-            RETURN node.id AS id, node.text AS text, node.source AS source, score
+            RETURN node.id AS id, node.text AS text, node.source AS source,
+                   node.metadata AS metadata, score
             LIMIT $k
             """,
             vector=vector,
@@ -76,7 +93,10 @@ class Neo4jVectorStore(VectorStore):
         return [
             RetrievedChunk(
                 chunk_id=r["id"], text=r["text"], source=r["source"],
-                score=float(r["score"]), retriever="vector",
+                score=float(r["score"]), retriever="vector", metadata=_meta(r["metadata"]),
             )
             for r in rows
         ]
+
+    # delete_source: vectors live on the chunk nodes, which
+    # GraphStore.delete_document removes — the base no-op is correct here.

@@ -11,7 +11,7 @@ export default function App() {
   const [user, setUser] = useState(getUser());
 
   return (
-    <div className="mx-auto flex h-full max-w-3xl flex-col gap-3 bg-slate-100 p-4">
+    <div className="mx-auto flex h-full max-w-4xl flex-col gap-3 bg-slate-100 p-4">
       <header className="space-y-2">
         <div className="flex items-start justify-between">
           <div>
@@ -32,7 +32,7 @@ export default function App() {
       <Upload key={`upload-${user}`} />
 
       <main className="flex-1 overflow-hidden rounded-2xl bg-slate-50 p-3 ring-1 ring-slate-200">
-        <Chat key={`chat-${user}`} style={style} />
+        <Chat key={`chat-${user}`} style={style} user={user} />
       </main>
     </div>
   );

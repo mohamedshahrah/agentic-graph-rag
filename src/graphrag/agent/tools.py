@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 from langchain_core.tools import StructuredTool
 
 from graphrag.core.types import RetrievedChunk
+from graphrag.embeddings.base import Embedder
 from graphrag.retrieval.hybrid import HybridRetriever
 from graphrag.retrieval.vector import VectorRetriever
 from graphrag.storage.graph.base import GraphStore
@@ -24,6 +25,7 @@ class ToolContext:
     vector: VectorRetriever
     hybrid: HybridRetriever
     graph: GraphStore
+    embedder: Embedder
     top_k: int = 8
     graph_hops: int = 2
     collected: list[RetrievedChunk] = field(default_factory=list)
@@ -98,6 +100,14 @@ def build_tools(ctx: ToolContext) -> list[StructuredTool]:
             blocks.append(f"### {name}\n{_format(chunks)}")
         return "\n\n".join(blocks)
 
+    def global_search(question: str) -> str:
+        """Answer corpus-wide questions ('what are the main themes?', 'give an
+        overview') from community summaries of the whole knowledge graph. Use when
+        the question is about the collection as a whole, not one specific fact."""
+        from graphrag.ingestion.enrich import global_search as _global
+
+        return _global(ctx.graph, ctx.embedder, question)
+
     return [
         StructuredTool.from_function(hybrid_search),
         StructuredTool.from_function(vector_search),
@@ -106,4 +116,5 @@ def build_tools(ctx: ToolContext) -> list[StructuredTool]:
         StructuredTool.from_function(get_entity),
         StructuredTool.from_function(fulltext_search),
         StructuredTool.from_function(compare),
+        StructuredTool.from_function(global_search),
     ]

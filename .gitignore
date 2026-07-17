@@ -17,10 +17,12 @@ dist/
 # Data & models
 # Ignore ingested/uploaded content, but ship the sample corpus the README's
 # quickstart ingests — without it, `graphrag ingest data/sample.md` fails on a
-# fresh clone.
+# fresh clone — and the golden eval set that scores against it.
 data/*
 !data/.gitkeep
 !data/sample.md
+!data/eval/
+!data/eval/**
 models/
 *.log
 

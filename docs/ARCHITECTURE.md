@@ -51,9 +51,20 @@ different store) means writing one adapter, not touching the layers around it.
 4. **Extract.** The LLM reads each chunk and pulls out entities and the typed
    relationships between them. These become nodes and edges in Neo4j, and each
    chunk is linked to the entities it mentions (`Chunk -[:MENTIONS]-> Entity`).
+   Extraction calls run concurrently (`ingestion.max_concurrency`).
 5. **Store.** Chunk vectors live on `:Chunk` nodes with a native Neo4j vector
-   index; entities and relations form the graph. One database holds both, so
-   going from a matched chunk to its entities is a single hop.
+   index (or in the file-backed `local` store); entities and relations form the
+   graph. One database holds both, so going from a matched chunk to its entities
+   is a single hop.
+6. **Enrich.** Once the document is stored, two passes run: **entity resolution**
+   merges duplicates the per-chunk extractor couldn't ("Acme" / "Acme Robotics"),
+   and **community detection** clusters the graph and LLM-summarizes each cluster.
+   Those summaries answer whole-corpus questions that no single chunk can, via the
+   agent's `global_search` tool.
+
+Every node carries a `corpus` tag and every constraint, index, read, and write is
+keyed on it — that (not a shared bare key) is what keeps one tenant's entities and
+answers out of another's.
 
 ## Answering a question
 
@@ -63,13 +74,20 @@ different store) means writing one adapter, not touching the layers around it.
    several subjects at once. Tool descriptions live in `agent/tools.py`.
 3. Every tool records the exact chunks it surfaced, so the API can return
    precise sources alongside the answer.
-4. **Hybrid retrieval** runs vector, graph-augmented, and keyword search in
-   parallel, fuses the three rankings with Reciprocal Rank Fusion (which needs no
-   comparable scores), then a reranker orders the finalists.
+4. **Hybrid retrieval** runs vector, graph-augmented, and keyword search
+   concurrently (a thread apiece), fuses the three rankings with Reciprocal Rank
+   Fusion (which needs no comparable scores), then a reranker orders the
+   finalists. Graph-augmented retrieval doesn't just re-find the seed entities —
+   it follows relationships out to `graph_hops` and scores chunks by graph
+   distance.
 5. The agent writes the answer in the requested style, citing sources.
 
 Multi-turn memory is handled by a LangGraph checkpointer keyed on a `thread_id`
-(Redis-backed when available).
+(Redis-backed when reachable, in-process otherwise). The API and CLI use the
+async and sync saver flavors respectively over one keyspace — the async one is
+required because `/query` streams over `astream`. The streaming path also emits
+`tool` events as the agent picks strategies, so the UI can show activity instead
+of sitting silent through retrieval.
 
 ## Why these choices
 

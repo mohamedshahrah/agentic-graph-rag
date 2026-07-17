@@ -11,6 +11,18 @@ export interface Source {
   retriever: string;
 }
 
+export interface StoredFile {
+  file_id: string;
+  name: string;
+  source: string;
+}
+
+export interface FileList {
+  files: StoredFile[];
+  used: number;
+  limit: number;
+}
+
 const API = "/api";
 const USER_KEY = "graphrag_user";
 const APIKEY_KEY = "graphrag_key";
@@ -43,6 +55,25 @@ function headers(extra: Record<string, string> = {}): Record<string, string> {
   return h;
 }
 
+// Every non-streaming call goes through this. Without it an error response
+// parses as success with all fields undefined — a rejected upload showed
+// "queued" forever while polling /ingest/undefined for eternity.
+async function jsonOrThrow<T>(res: Response): Promise<T> {
+  if (!res.ok) {
+    let detail = `${res.status} ${res.statusText}`;
+    try {
+      const body = await res.json();
+      if (body?.detail) {
+        detail = typeof body.detail === "string" ? body.detail : JSON.stringify(body.detail);
+      }
+    } catch {
+      /* non-JSON error body — keep the status line */
+    }
+    throw new Error(detail);
+  }
+  return res.json() as Promise<T>;
+}
+
 // The agent can be silent for a minute while it retrieves, so we can't time out
 // on "no tokens yet". The server pings every ~15s, so silence past this means the
 // connection is actually dead. Without a bound, a dropped connection leaves
@@ -56,6 +87,7 @@ export async function streamQuery(
   threadId: string,
   onToken: (t: string) => void,
   onSources: (s: Source[]) => void,
+  onTool?: (name: string) => void,
 ): Promise<void> {
   const control = new AbortController();
   let idle: ReturnType<typeof setTimeout> | undefined;
@@ -96,6 +128,7 @@ export async function streamQuery(
       for (const raw of events) {
         const { event, data } = parseEvent(raw);
         if (event === "token") onToken(data);
+        else if (event === "tool") onTool?.(data);
         else if (event === "sources") onSources(JSON.parse(data) as Source[]);
         else if (event === "error") throw new Error(data || "the server reported an error");
       }
@@ -126,12 +159,30 @@ export async function uploadFile(file: File): Promise<{ job_id: string }> {
   const form = new FormData();
   form.append("file", file);
   const res = await fetch(`${API}/ingest/upload`, { method: "POST", headers: headers(), body: form });
-  return res.json();
+  return jsonOrThrow(res);
 }
 
-export async function ingestStatus(jobId: string) {
+export async function ingestStatus(jobId: string): Promise<{
+  status: string;
+  chunks?: number;
+  entities?: number;
+  detail?: string;
+}> {
   const res = await fetch(`${API}/ingest/${jobId}`, { headers: headers() });
-  return res.json();
+  return jsonOrThrow(res);
+}
+
+export async function listFiles(): Promise<FileList> {
+  const res = await fetch(`${API}/ingest/files`, { headers: headers() });
+  return jsonOrThrow(res);
+}
+
+export async function deleteFile(fileId: string): Promise<{ chunks_removed: number }> {
+  const res = await fetch(`${API}/ingest/files/${fileId}`, {
+    method: "DELETE",
+    headers: headers(),
+  });
+  return jsonOrThrow(res);
 }
 
 export interface Ready {
@@ -142,17 +193,17 @@ export interface Ready {
 
 export async function getReady(): Promise<Ready> {
   const res = await fetch(`${API}/ready`, { headers: headers() });
-  return res.json();
+  return jsonOrThrow(res);
 }
 
 export async function getHealth(): Promise<{ status: string; version: string }> {
   const res = await fetch(`${API}/health`, { headers: headers() });
-  return res.json();
+  return jsonOrThrow(res);
 }
 
 export async function listUsers(): Promise<{ users: string[] }> {
   const res = await fetch(`${API}/users`, { headers: headers() });
-  return res.json();
+  return jsonOrThrow(res);
 }
 
 export async function createUser(
@@ -166,5 +217,5 @@ export async function createUser(
     headers: headers(extra),
     body: JSON.stringify({ user_id: userId }),
   });
-  return res.json();
+  return jsonOrThrow(res);
 }

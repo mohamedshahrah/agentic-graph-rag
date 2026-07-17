@@ -12,6 +12,7 @@ import os
 
 from arq.connections import RedisSettings
 
+from graphrag.config.settings import Secrets
 from graphrag.container import Container
 from graphrag.core.logging import get_logger
 from graphrag.jobs import JobStatus, JobStore
@@ -19,7 +20,9 @@ from graphrag.pipelines import IngestPipeline
 
 log = get_logger(__name__)
 
-_REDIS_URL = os.environ.get("GRAPHRAG_REDIS_URL", "redis://localhost:6379/0")
+# Through Secrets, not raw os.environ — so a bare `arq graphrag.worker...` run
+# picks the URL up from .env exactly like every other entrypoint.
+_REDIS_URL = Secrets().redis_url
 
 
 async def ingest_task(ctx: dict, job_id: str, path: str, user_id: str | None) -> None:

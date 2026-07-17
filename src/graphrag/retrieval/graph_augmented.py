@@ -1,6 +1,7 @@
 """Graph-augmented retrieval: find the entities a query is about, then pull the
-chunks that mention them and their neighbors. This is what makes it *graph* RAG
-rather than plain vector RAG — it can follow relationships, not just similarity."""
+chunks that mention them *and their graph neighborhood*, scored by how many hops
+an entity sits from a seed. This is what makes it *graph* RAG rather than plain
+vector RAG — it follows relationships, not just similarity."""
 
 from __future__ import annotations
 
@@ -18,4 +19,4 @@ class GraphAugmentedRetriever(Retriever):
         seeds = self._graph.fulltext_entities(query, k=5)
         if not seeds:
             return []
-        return self._graph.chunks_for_entities(seeds, limit=k)
+        return self._graph.expand_chunks(seeds, hops=self._hops, limit=k)

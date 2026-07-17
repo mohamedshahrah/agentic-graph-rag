@@ -4,6 +4,8 @@ the agent's `hybrid_search` tool calls."""
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
+
 from graphrag.core.types import RetrievedChunk
 from graphrag.retrieval.base import Retriever
 from graphrag.retrieval.fusion import reciprocal_rank_fusion
@@ -29,10 +31,15 @@ class HybridRetriever(Retriever):
         self._candidate_k = candidate_k
 
     def retrieve(self, query: str, k: int) -> list[RetrievedChunk]:
-        lists: list[list[RetrievedChunk]] = [
-            self._vector.retrieve(query, self._candidate_k),
-            self._graph_aug.retrieve(query, self._candidate_k),
-            self._graph.fulltext_chunks(query, self._candidate_k),
-        ]
+        # The three retrievals are independent I/O (embedding call + two Neo4j
+        # round-trips); running them together cuts the retrieval phase to the
+        # slowest leg instead of the sum.
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            futures = [
+                pool.submit(self._vector.retrieve, query, self._candidate_k),
+                pool.submit(self._graph_aug.retrieve, query, self._candidate_k),
+                pool.submit(self._graph.fulltext_chunks, query, self._candidate_k),
+            ]
+            lists: list[list[RetrievedChunk]] = [f.result() for f in futures]
         fused = reciprocal_rank_fusion(lists)[: self._candidate_k]
         return self._reranker.rerank(query, fused, k)

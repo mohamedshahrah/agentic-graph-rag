@@ -36,14 +36,19 @@ export default function UserBar({ user, onChange }: { user: string; onChange: (u
   async function add() {
     const name = newName.trim();
     if (!name) return;
-    const r = await createUser(name, apiKey || undefined);
-    setUsers((prev) => Array.from(new Set([...prev, r.user_id])));
-    setNewName("");
-    if (r.api_key) {
-      saveKey(r.api_key);
-      setNote("New API key saved — copy it now, it won't be shown again.");
+    try {
+      const r = await createUser(name, apiKey || undefined);
+      setUsers((prev) => Array.from(new Set([...prev, r.user_id])));
+      setNewName("");
+      if (r.api_key) {
+        saveKey(r.api_key);
+        setNote("New API key saved — copy it now, it won't be shown again.");
+      }
+      select(r.user_id);
+    } catch (err) {
+      // A 403 here used to select a user literally named "undefined".
+      setNote(`Could not create user: ${String((err as Error).message ?? err)}`);
     }
-    select(r.user_id);
   }
 
   return (

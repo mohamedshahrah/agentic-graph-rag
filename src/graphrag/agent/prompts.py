@@ -15,6 +15,9 @@ You have retrieval tools. Use them — never answer from prior knowledge alone:
 - get_entity: look up what the graph knows about one entity.
 - fulltext_search: exact keyword lookup when you know the term.
 - compare: gather evidence about several subjects at once for a side-by-side answer.
+- global_search: whole-corpus overview from knowledge-graph community summaries. Use
+  for "what is this collection about?", "main themes", or other questions no single
+  passage answers.
 
 How to work:
 1. Decide which tool(s) fit the question. Combine tools when useful (e.g. hybrid_search

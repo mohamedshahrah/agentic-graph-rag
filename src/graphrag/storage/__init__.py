@@ -1,37 +1,39 @@
 """Storage factories. Backends are chosen by config; Neo4j is the default and
-serves as both the graph store and the vector store (one connection)."""
+serves as both the graph store and the vector store (one connection). These are
+the seams a new backend plugs into — the container calls them per tenant."""
 
 from __future__ import annotations
 
-from graphrag.config.settings import Secrets, Settings
+from graphrag.config.settings import Settings
 from graphrag.core.errors import ConfigError
 from graphrag.storage.graph.base import GraphStore
-from graphrag.storage.neo4j_client import driver_from_secrets
 from graphrag.storage.vector.base import VectorStore
 
 
-def build_graph_store(settings: Settings, secrets: Secrets) -> GraphStore:
-    if settings.storage.graph.provider == "neo4j":
+def build_graph_store(
+    driver, database: str, corpus: str, settings: Settings
+) -> GraphStore:
+    provider = settings.storage.graph.provider
+    if provider == "neo4j":
         from graphrag.storage.graph.neo4j_store import Neo4jGraphStore
 
-        return Neo4jGraphStore(
-            driver_from_secrets(secrets), settings.storage.graph.database, settings.app.corpus
-        )
-    raise ConfigError(f"Unknown graph provider: {settings.storage.graph.provider}")
+        return Neo4jGraphStore(driver, database, corpus)
+    raise ConfigError(f"Unknown graph provider: {provider}")
 
 
-def build_vector_store(settings: Settings, secrets: Secrets) -> VectorStore:
-    if settings.storage.vector.provider == "neo4j":
+def build_vector_store(
+    driver, database: str, corpus: str, settings: Settings
+) -> VectorStore:
+    cfg = settings.storage.vector
+    if cfg.provider == "neo4j":
         from graphrag.storage.vector.neo4j_vector import Neo4jVectorStore
 
-        return Neo4jVectorStore(
-            driver_from_secrets(secrets),
-            settings.storage.graph.database,
-            settings.app.corpus,
-            settings.storage.vector.index_name,
-            settings.storage.vector.similarity,
-        )
-    raise ConfigError(f"Unknown vector provider: {settings.storage.vector.provider}")
+        return Neo4jVectorStore(driver, database, corpus, cfg.index_name, cfg.similarity)
+    if cfg.provider == "local":
+        from graphrag.storage.vector.local_store import LocalVectorStore
+
+        return LocalVectorStore(cfg.local_dir, database, corpus, cfg.similarity)
+    raise ConfigError(f"Unknown vector provider: {cfg.provider}")
 
 
 __all__ = ["GraphStore", "VectorStore", "build_graph_store", "build_vector_store"]

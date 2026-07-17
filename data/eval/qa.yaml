@@ -1,0 +1,27 @@
+# Golden Q&A over data/sample.md. Every question names the keywords a correct
+# answer must contain and the source file the evidence must come from.
+#
+# Add cases for your own corpus the same way; `make eval` scores them all.
+- question: Who founded Acme Robotics?
+  expect_keywords: [Dana Ruiz, Sam Okafor]
+  expect_source: sample.md
+
+- question: What is the Pallet Pilot and who makes it?
+  expect_keywords: [forklift, Acme]
+  expect_source: sample.md
+
+- question: How are Acme Robotics and Riverside University connected?
+  expect_keywords: [RouteMind]
+  expect_source: sample.md
+
+- question: Where did Sam Okafor study and work before Acme?
+  expect_keywords: [Riverside, Initech]
+  expect_source: sample.md
+
+- question: Which company did Acme Robotics acquire, and why?
+  expect_keywords: [GridSense, mapping]
+  expect_source: sample.md
+
+- question: Who are Acme's competitors and what do they sell?
+  expect_keywords: [Globex, HeavyHauler, BluePeak, SwiftLift]
+  expect_source: sample.md

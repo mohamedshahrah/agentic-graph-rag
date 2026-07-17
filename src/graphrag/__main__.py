@@ -73,6 +73,16 @@ def apikey(user: str) -> None:
 
 
 @app.command()
+def revoke(user: str) -> None:
+    """Revoke every API key a user holds (their data stays)."""
+    from graphrag.auth import KeyStore
+    from graphrag.container import Container
+
+    count = KeyStore(Container().redis).revoke_user(user)
+    typer.echo(f"Revoked {count} key(s) for '{user}'.")
+
+
+@app.command()
 def serve(host: str = "0.0.0.0", port: int = 8000, reload: bool = False) -> None:
     """Start the API server."""
     import uvicorn

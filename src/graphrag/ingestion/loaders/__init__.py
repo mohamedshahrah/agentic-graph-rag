@@ -8,6 +8,9 @@ from pathlib import Path
 from graphrag.core.errors import IngestionError
 from graphrag.core.types import Document
 from graphrag.ingestion.loaders.base import Loader
+from graphrag.ingestion.loaders.csv import CSVLoader
+from graphrag.ingestion.loaders.docx import DocxLoader
+from graphrag.ingestion.loaders.html import HTMLLoader
 from graphrag.ingestion.loaders.image import ImageLoader
 from graphrag.ingestion.loaders.pdf import PDFLoader
 from graphrag.ingestion.loaders.text import TextLoader
@@ -18,6 +21,9 @@ def build_loaders(ocr: OCREngine | None = None, min_text_chars: int = 100) -> li
     return [
         TextLoader(),
         PDFLoader(ocr=ocr, min_text_chars=min_text_chars),
+        DocxLoader(),
+        HTMLLoader(),
+        CSVLoader(),
         ImageLoader(ocr=ocr),
     ]
 
