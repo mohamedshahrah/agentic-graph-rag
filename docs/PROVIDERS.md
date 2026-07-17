@@ -113,6 +113,26 @@ on GPU even at 4096). `ollama ps` is the test: below `100% GPU` you're paying fo
 weights you can't use. On a bigger card this flips, which is why it's a config
 key rather than a default.
 
+### One context per model, everywhere it appears
+
+Ollama keys a loaded runner by **(model, options)** — so the same model at two
+context sizes is **two runners**, competing for the same VRAM. This is easy to do
+by accident: giving reranking a small `num_ctx` looks like a saving, and is the
+opposite. On a 6 GB card, chat at 8192 + reranking at 2048 means Ollama evicts
+chat to rerank, then evicts reranking to answer — every query.
+
+| Reranking config | rerank | then chat | total |
+|---|---|---|---|
+| e4b @2048 (separate runner) | 17.5s | 15.8s | **33.4s** |
+| e2b @2048 (smaller — still separate) | 14.7s | 16.5s | **31.2s** |
+| **e4b @8192 (same runner as chat)** | **3.6s** | **1.9s** | **5.5s** |
+
+A **6x** difference, same rerank scores, same model. Note the middle row: a
+*smaller* model barely helped, because the cost was never size — it was the swap.
+Give every role that shares a model the identical `num_ctx`, even where a smaller
+one would do; if it doesn't change the VRAM (4096 and 8192 are both 3.3 GB for
+gemma4), the smaller number is pure cost.
+
 ### Using a bigger Gemma 4 for chat
 
 Gemma 4 has native tool calling across the whole family (including the small

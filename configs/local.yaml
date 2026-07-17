@@ -49,17 +49,31 @@ ingestion:
     model: gemma4:e4b-it-q4_K_M   # NOT gemma3 — too noisy to follow the prompt
     max_tokens: 2048
     extra:
-      num_ctx: 4096           # one 384-token chunk in, JSON out — 8192 is wasted VRAM
+      # 8192, matching `llm` — not the 4096 extraction actually needs. A smaller
+      # context here would be a second Ollama runner for the same model, and
+      # measures 3.3 GB either way (4096 and 8192 are identical; 16384 is the
+      # cliff). So the smaller number buys nothing and costs a model swap if a
+      # query lands while an ingest is running.
+      num_ctx: 8192
       reasoning: false        # thinking doubles the time for identical output
 
 retrieval:
-  # Generative reranking costs one LLM call per candidate, so candidate_k is the
-  # dial on query latency here — unlike the `api` profile, where Voyage scores
-  # the whole batch in one request and 24 is nearly free. 12 halves the rerank
-  # work; the cost is recall, since a chunk outside the top 12 can't be rescued.
+  # Generative reranking is one LLM call per candidate, so this is the dial on
+  # rerank cost — unlike the `api` profile, where Voyage scores the whole batch
+  # in one request and 24 is nearly free. 12 candidates rerank in ~3.6s on the
+  # shared runner. Raising it trades latency for recall; a chunk outside the
+  # candidate set can never be rescued by reranking.
   candidate_k: 12
   rerank:
     provider: ollama
+    # Identical model AND num_ctx to `llm` above — deliberately, and it is the
+    # single biggest win on a small GPU. Ollama keys a loaded runner by
+    # (model, options), so num_ctx 2048 here would be a *second* runner: it
+    # evicts chat to rerank, then evicts rerank to answer, twice per query.
+    # Measured: rerank 17.5s + chat 15.8s = 33.4s with a separate runner,
+    # versus 3.6s + 1.9s = 5.5s sharing this one. Same scores either way.
+    # 8192 costs nothing here — it's the same resident instance, not a copy.
     model: gemma4:e4b-it-q4_K_M
     extra:
-      num_ctx: 2048           # query + one chunk + a single number
+      num_ctx: 8192
+      reasoning: false

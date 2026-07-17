@@ -181,12 +181,25 @@ the same one everywhere. See [`docs/CONFIGURATION.md`](docs/CONFIGURATION.md) an
 control (device, batch size, normalization, prefixes, Matryoshka dimensions,
 caching).
 
-**On a small GPU, `num_ctx` matters more than the model you pick.** Ollama sizes
-its KV cache from the context length, and that cache — not the weights — is
-usually what spills a model onto the CPU: gemma4 at Ollama's default context is
-9.9 GB and lands 71% on CPU, but 3.3 GB and 100% on GPU at `num_ctx: 8192`.
-Extraction gets 4096 (it sees one chunk), reranking 2048 (a query and one chunk).
-`ollama ps` shows the CPU/GPU split — that's the number to watch.
+**On a small GPU, `num_ctx` matters more than the model you pick** — twice over.
+
+*It decides whether the model fits.* Ollama sizes its KV cache from the context
+length, and that cache — not the weights — is usually what spills a model onto
+the CPU: gemma4 at Ollama's default context is 9.9 GB and lands 71% on CPU, but
+3.3 GB and 100% on GPU at `num_ctx: 8192`. `ollama ps` shows the split.
+
+*And it decides how many models you load.* **Ollama keys a loaded runner by
+(model, options), so the same model at two context sizes is two runners.** Give
+chat 8192 and reranking 2048 and you haven't saved memory — you've told a 6 GB
+card to hold two copies, so it evicts one to rerank and the other to answer,
+twice per query. Measured: **33.4s split across two runners, 5.5s sharing one.**
+That's why the local profile gives chat, reranking and extraction the *identical*
+`num_ctx`, even where a smaller one would do — 4096 and 8192 are both 3.3 GB
+anyway (16384 is the cliff), so the smaller number buys nothing and costs a swap.
+
+The rule: **pick one context per model and use it everywhere that model appears.**
+Different *models* (gemma3 for OCR, gemma4 for the rest) will still swap — that's
+unavoidable on a small card — but the same model should never swap with itself.
 
 ---
 
