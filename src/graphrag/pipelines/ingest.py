@@ -37,9 +37,33 @@ class IngestStats:
     files: list[str] = field(default_factory=list)
 
 
+class LimitExceededError(RuntimeError):
+    """The ingest would push the user past a quota. Surfaced as a failed job
+    with a message the UI can show, not a stack trace."""
+
+
 class IngestPipeline:
-    def __init__(self, container: Container) -> None:
+    def __init__(self, container: Container, max_chunks: int | None = None) -> None:
         self._c = container
+        self._max_chunks = max_chunks
+
+    def _check_capacity(self, tenant: Tenant, incoming: int) -> None:
+        """Refuse a document that would exceed the tenant's chunk allowance.
+
+        Checked per document rather than once up front: a folder ingest should
+        store what fits and stop at the boundary, not fail wholesale.
+        """
+        if not self._max_chunks:
+            return
+        count = getattr(tenant.vector_store, "count", None)
+        if count is None:
+            return  # backend can't report a total; the file/storage caps still apply
+        current = count()
+        if current + incoming > self._max_chunks:
+            raise LimitExceededError(
+                f"Storage limit reached: {current} of {self._max_chunks} chunks used. "
+                "Delete a document to free space."
+            )
 
     def run(self, path: str | Path, user_id: str | None = None) -> IngestStats:
         c = self._c
@@ -62,6 +86,10 @@ class IngestPipeline:
             replaced += tenant.vector_store.delete_source(document.source)
             if replaced:
                 log.info("reingest_replaced", source=document.source, removed=replaced)
+
+            # After the replace, so re-ingesting an existing document is
+            # measured against the space it is about to free.
+            self._check_capacity(tenant, len(chunks))
 
             embeddings = c.embedder.embed_documents([ch.text for ch in chunks])
             for ch, vec in zip(chunks, embeddings, strict=True):

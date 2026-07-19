@@ -236,6 +236,12 @@ async def _lifespan(app: FastAPI):
     )
     app.state.key_store = PgKeyStore(app.state.db, container.redis)
 
+    from graphrag.limits import LimitService
+    from graphrag.usage import UsageRecorder
+
+    app.state.limits = LimitService(app.state.db, container.redis)
+    app.state.usage = UsageRecorder(app.state.db, app.state.limits)
+
     # Bootstrap the first admin from configuration: with no admin account and
     # no admin key, the admin surface is locked (fail-closed), and there would
     # be no way in.
@@ -314,8 +320,14 @@ def create_app(container: Container | None = None) -> FastAPI:
     app.state.job_store = JobStore(container.redis)
     app.state.users = {container.settings.tenancy.default_user}
     # Real instances are built in the lifespan, once the database engine exists.
+    # Limits work without one (falling back to the shipped defaults), so that
+    # one is usable immediately.
     app.state.accounts = None
     app.state.key_store = None
+    app.state.usage = None
+    from graphrag.limits import LimitService
+
+    app.state.limits = LimitService(None, container.redis)
     if container.settings.auth.enabled:
         log.info("auth_enabled", note="session cookie or API key required")
         if not (container.secrets.admin_api_key or container.secrets.admin_email):
@@ -352,11 +364,12 @@ def create_app(container: Container | None = None) -> FastAPI:
     def metrics() -> Response:
         return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
-    from graphrag.api.routers import auth, health, ingest, query, search, users
+    from graphrag.api.routers import auth, health, ingest, query, search, threads, users
 
     app.include_router(health.router)
     app.include_router(auth.router)
     app.include_router(users.router)
+    app.include_router(threads.router)
     app.include_router(ingest.router)
     app.include_router(query.router)
     app.include_router(search.router)

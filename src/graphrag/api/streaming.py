@@ -4,7 +4,6 @@ as the agent picks retrieval strategies, incremental `token` events, then one
 
 from __future__ import annotations
 
-import contextlib
 import json
 import time
 from collections.abc import AsyncIterator
@@ -12,16 +11,9 @@ from collections.abc import AsyncIterator
 from graphrag.api.schemas import Source
 from graphrag.core.logging import get_logger
 from graphrag.pipelines import QueryService
+from graphrag.usage.recorder import TOKENS_OUT, record_usage
 
 log = get_logger(__name__)
-
-
-def record_usage(redis_client, user_id: str | None, tokens: int) -> None:
-    """Best-effort per-user token accounting (streamed chunks ≈ tokens)."""
-    if redis_client is None or tokens <= 0:
-        return
-    with contextlib.suppress(Exception):
-        redis_client.hincrby("graphrag:usage:tokens", user_id or "default", tokens)
 
 
 async def sse_answer(
@@ -32,10 +24,14 @@ async def sse_answer(
     user_id: str | None = None,
     redis_client=None,
     model=None,
+    recorder=None,
+    account_id: str | None = None,
+    on_complete=None,
 ) -> AsyncIterator[dict]:
     sources = []
     started = time.perf_counter()
     tokens = 0
+    answer_parts: list[str] = []
     first_token_at: float | None = None
     log.info("stream_started", question=question[:80], style=style, user=user_id or "-")
     try:
@@ -55,10 +51,18 @@ async def sse_answer(
                 first_token_at = time.perf_counter() - started
                 log.info("stream_first_token", seconds=round(first_token_at, 1))
             tokens += 1
+            answer_parts.append(data)
             yield {"event": "token", "data": data}
         payload = [Source.from_chunk(c).model_dump() for c in sources]
         yield {"event": "sources", "data": json.dumps(payload)}
+
         record_usage(redis_client, user_id, tokens)
+        if recorder is not None and account_id:
+            await recorder.record(account_id, TOKENS_OUT, tokens, {"style": style})
+        if on_complete is not None:
+            # After `sources`, so a slow write cannot delay the visible answer.
+            await on_complete("".join(answer_parts), sources)
+
         log.info(
             "stream_done",
             tokens=tokens,

@@ -20,6 +20,7 @@ from graphrag.api.deps import (
     get_accounts,
     get_container,
     get_current_user,
+    get_db,
     get_key_store,
 )
 from graphrag.api.schemas import (
@@ -29,6 +30,7 @@ from graphrag.api.schemas import (
     APIKeyInfo,
     APIKeyList,
     EmailRequest,
+    LimitsInfo,
     LoginRequest,
     Me,
     ModelOption,
@@ -37,6 +39,7 @@ from graphrag.api.schemas import (
 )
 from graphrag.container import Container
 from graphrag.core.logging import get_logger
+from graphrag.limits import get_limits
 from graphrag.llm.registry import allowed_models, resolve_model
 
 router = APIRouter(prefix="/auth", tags=["auth"])
@@ -176,6 +179,52 @@ async def me(
         models=_model_options(container),
         default_model=resolve_model(None, container.settings).model,
     )
+
+
+@router.get("/limits", response_model=LimitsInfo)
+async def my_limits(
+    user: AuthUser = Depends(get_current_user),
+    limits=Depends(get_limits),
+    db=Depends(get_db),
+) -> LimitsInfo:
+    """Allowances and consumption, for the account page's meters."""
+    effective = await limits.effective(user.user_id)
+    info = LimitsInfo(
+        limits=effective.as_dict(), usage=await limits.usage_snapshot(user.user_id)
+    )
+    if db is None:
+        return info
+
+    import uuid as _uuid
+
+    from sqlalchemy import func, select
+
+    from graphrag.db.engine import session_scope
+    from graphrag.db.models import File, Thread
+
+    try:
+        owner = _uuid.UUID(str(user.user_id))
+    except (ValueError, AttributeError, TypeError):
+        return info
+
+    async with session_scope(db) as s:
+        files, stored = (
+            await s.execute(
+                select(func.count(), func.coalesce(func.sum(File.size_bytes), 0))
+                .where(File.user_id == owner)
+            )
+        ).one()
+        threads = (
+            await s.execute(
+                select(func.count()).select_from(Thread).where(
+                    Thread.user_id == owner, Thread.deleted_at.is_(None)
+                )
+            )
+        ).scalar_one()
+    info.files_used = int(files)
+    info.storage_used_mb = round(int(stored) / (1024 * 1024), 2)
+    info.threads_used = int(threads)
+    return info
 
 
 # -- personal API keys --------------------------------------------------------

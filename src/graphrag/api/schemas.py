@@ -155,6 +155,49 @@ class APIKeyCreated(BaseModel):
     api_key: str  # shown once
 
 
+class ThreadInfo(BaseModel):
+    id: str
+    title: str
+    created_at: str = ""
+    updated_at: str = ""
+
+
+class ThreadList(BaseModel):
+    threads: list[ThreadInfo] = []
+
+
+class ThreadCreate(BaseModel):
+    title: str = Field("New chat", max_length=120)
+
+
+class ThreadUpdate(BaseModel):
+    title: str | None = Field(None, max_length=120)
+
+
+class MessageInfo(BaseModel):
+    id: int
+    role: str
+    content: str
+    sources: list = []
+    model: str = ""
+    created_at: str = ""
+
+
+class ThreadMessages(BaseModel):
+    thread: ThreadInfo
+    messages: list[MessageInfo] = []
+
+
+class LimitsInfo(BaseModel):
+    """A user's allowances and what they've used, for the account page."""
+
+    limits: dict[str, int] = {}
+    usage: dict[str, int] = {}
+    files_used: int = 0
+    storage_used_mb: float = 0.0
+    threads_used: int = 0
+
+
 class UserCreate(BaseModel):
     user_id: str = Field(..., min_length=1, max_length=48)
 

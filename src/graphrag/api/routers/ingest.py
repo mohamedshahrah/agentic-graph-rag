@@ -16,8 +16,9 @@ import uuid
 from pathlib import Path
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, UploadFile
+from sqlalchemy import delete, func, select, text
 
-from graphrag.api.deps import AuthUser, get_container, get_current_user, get_job_store
+from graphrag.api.deps import AuthUser, get_container, get_current_user, get_db, get_job_store
 from graphrag.api.schemas import (
     DeleteResponse,
     FileList,
@@ -27,7 +28,11 @@ from graphrag.api.schemas import (
 )
 from graphrag.container import Container
 from graphrag.core.logging import get_logger
+from graphrag.db.engine import session_scope
+from graphrag.db.models import File
 from graphrag.jobs import JobStatus, JobStore
+from graphrag.limits import effective_limits, reject_with
+from graphrag.limits.service import LimitBreach, Limits
 from graphrag.pipelines import IngestPipeline
 
 router = APIRouter(tags=["ingest"])
@@ -56,11 +61,14 @@ _URL_SUFFIX = {
 _INGEST_SLOT = asyncio.Semaphore(1)
 
 
-def _inproc_ingest(container: Container, store: JobStore, job_id: str, path: str, user_id) -> None:
+def _inproc_ingest(
+    container: Container, store: JobStore, job_id: str, path: str, user_id,
+    max_chunks: int | None = None,
+) -> None:
     """Run the pipeline and record the outcome. Blocking — call it off the loop."""
     store.set(JobStatus(job_id, status="running"))
     try:
-        stats = IngestPipeline(container).run(path, user_id=user_id)
+        stats = IngestPipeline(container, max_chunks=max_chunks).run(path, user_id=user_id)
         store.set(
             JobStatus(job_id, status="done", documents=stats.documents, chunks=stats.chunks,
                       entities=stats.entities, relations=stats.relations)
@@ -70,15 +78,43 @@ def _inproc_ingest(container: Container, store: JobStore, job_id: str, path: str
         store.set(JobStatus(job_id, status="error", detail=str(exc)))
 
 
-async def _run_ingest(container: Container, store: JobStore, job_id: str, path: str, user_id):
+async def _run_ingest(
+    container: Container, store: JobStore, job_id: str, path: str, user_id,
+    max_chunks: int | None = None, db=None, file_id: str | None = None,
+):
     """One queued ingest, off the event loop so streaming stays responsive."""
     async with _INGEST_SLOT:
-        await asyncio.to_thread(_inproc_ingest, container, store, job_id, path, user_id)
+        await asyncio.to_thread(
+            _inproc_ingest, container, store, job_id, path, user_id, max_chunks
+        )
+    await _finalize_file(db, file_id, store.get(job_id))
+
+
+async def _finalize_file(db, file_id: str | None, status: JobStatus | None) -> None:
+    """Record how the ingest ended on the file row, so the UI can show a
+    failed document instead of one that silently never became searchable."""
+    if db is None or not file_id or status is None:
+        return
+    from sqlalchemy import update as sql_update
+
+    try:
+        async with session_scope(db) as s:
+            await s.execute(
+                sql_update(File)
+                .where(File.id == file_id)
+                .values(
+                    status="ingested" if status.status == "done" else "error",
+                    chunks=getattr(status, "chunks", 0) or 0,
+                )
+            )
+    except Exception as exc:
+        log.warning("file_status_update_failed", file=file_id, error=str(exc))
 
 
 async def _enqueue(
     request: Request, background: BackgroundTasks, container: Container,
     store: JobStore, path: str, user_id,
+    max_chunks: int | None = None, db=None, file_id: str | None = None,
 ) -> IngestResponse:
     job_id = uuid.uuid4().hex[:12]
     store.set(JobStatus(job_id, status="queued"))
@@ -86,7 +122,9 @@ async def _enqueue(
     if arq is not None:
         await arq.enqueue_job("ingest_task", job_id, path, user_id)
     else:  # no worker -> run in this process
-        background.add_task(_run_ingest, container, store, job_id, path, user_id)
+        background.add_task(
+            _run_ingest, container, store, job_id, path, user_id, max_chunks, db, file_id
+        )
     return IngestResponse(job_id=job_id, status="queued")
 
 
@@ -94,38 +132,65 @@ def _files_key(user: str) -> str:
     return f"files:{user}"
 
 
-# Reserve atomically: HSET then check, undoing the write if it broke the cap.
-# Two requests racing must not both slip past the limit, which is why this is a
-# script rather than a read-then-write.
-_RESERVE = """
-redis.call('HSET', KEYS[1], ARGV[1], ARGV[2])
-if redis.call('HLEN', KEYS[1]) > tonumber(ARGV[3]) then
-  redis.call('HDEL', KEYS[1], ARGV[1])
-  return 0
-end
-return 1
-"""
+def _account_uuid(user: AuthUser) -> uuid.UUID | None:
+    """The account row's id, or None for a dev-mode namespace identity."""
+    try:
+        return uuid.UUID(str(user.user_id))
+    except (ValueError, AttributeError, TypeError):
+        return None
 
 
-def _reserve_file_slot(
-    container: Container, user: str, limit: int, file_id: str, path: str
-) -> bool:
-    """Claim a slot for `file_id`, tracking the file so the slot can be given back.
+async def _reserve_file_slot(
+    db, user: AuthUser, limits: Limits, file_id: str, name: str, path: str, size: int
+) -> LimitBreach | None:
+    """Claim a file slot in Postgres, or explain which quota refused it.
 
-    A plain counter would only ever go up: a failed ingest or a deleted file
-    would burn a slot for good, and at the cap the user is locked out with no
-    way back. Holding the actual files means the count reflects what exists.
+    Counting the rows that exist (rather than a counter that only goes up)
+    means a deleted file or a failed ingest gives its slot back on its own.
+    The advisory lock makes the count-then-insert atomic per user, so two
+    uploads racing cannot both slip past the cap.
     """
-    r = container.redis
-    if r is None:
-        return True  # cannot enforce a cross-request cap without Redis
-    return bool(r.eval(_RESERVE, 1, _files_key(user), file_id, path, limit))
+    owner = _account_uuid(user)
+    if db is None or owner is None:
+        return None  # nothing to enforce against; the size cap still applies
+
+    async with session_scope(db) as s:
+        await s.execute(
+            text("SELECT pg_advisory_xact_lock(hashtext(:k))"), {"k": str(owner)}
+        )
+        used, stored = (
+            await s.execute(
+                select(func.count(), func.coalesce(func.sum(File.size_bytes), 0)).where(
+                    File.user_id == owner
+                )
+            )
+        ).one()
+        if used >= limits.max_files:
+            return LimitBreach("max_files", int(used), limits.max_files)
+
+        storage_cap = limits.max_storage_mb * 1024 * 1024
+        if int(stored) + size > storage_cap:
+            return LimitBreach(
+                "max_storage_mb", int(stored) // (1024 * 1024), limits.max_storage_mb
+            )
+
+        s.add(
+            File(
+                id=file_id, user_id=owner, name=name, path=path,
+                size_bytes=size, status="uploaded",
+            )
+        )
+    return None
 
 
-def _release_file_slot(container: Container, user: str, file_id: str) -> None:
-    r = container.redis
-    if r is not None:
-        r.hdel(_files_key(user), file_id)
+async def _release_file_slot(db, user: AuthUser, file_id: str) -> None:
+    owner = _account_uuid(user)
+    if db is None or owner is None:
+        return
+    async with session_scope(db) as s:
+        await s.execute(
+            delete(File).where(File.id == file_id, File.user_id == owner)
+        )
 
 
 @router.post("/ingest/upload", response_model=IngestResponse)
@@ -136,75 +201,88 @@ async def ingest_upload(
     container: Container = Depends(get_container),
     store: JobStore = Depends(get_job_store),
     user: AuthUser = Depends(get_current_user),
+    limits: Limits = Depends(effective_limits),
+    db=Depends(get_db),
 ) -> IngestResponse:
     api = container.settings.api
     user_key = user.tenant_id
 
     data = await file.read()
-    if len(data) > api.max_upload_mb * 1024 * 1024:
-        raise HTTPException(status_code=413, detail=f"File exceeds {api.max_upload_mb} MB limit")
+    # The per-file cap is the smaller of the server ceiling and the user's own
+    # allowance, so raising one user's quota can't exceed what nginx will pass.
+    per_file_mb = min(api.max_upload_mb, limits.max_file_mb)
+    if len(data) > per_file_mb * 1024 * 1024:
+        raise HTTPException(status_code=413, detail=f"File exceeds {per_file_mb} MB limit")
 
     file_id = uuid.uuid4().hex[:8]
-    dest = _UPLOAD_DIR / (file_id + "_" + Path(file.filename or "upload").name)
-    if not _reserve_file_slot(container, user_key, api.max_files_per_user, file_id, str(dest)):
-        raise HTTPException(
-            status_code=429,
-            detail=(
-                f"File limit reached ({api.max_files_per_user} per user). "
-                "Delete a file to free a slot."
-            ),
-        )
+    name = Path(file.filename or "upload").name
+    dest = _UPLOAD_DIR / (file_id + "_" + name)
+
+    breach = await _reserve_file_slot(db, user, limits, file_id, name, str(dest), len(data))
+    if breach is not None:
+        raise reject_with(breach)
 
     try:
         _UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
         dest.write_bytes(data)
     except OSError:
-        _release_file_slot(container, user_key, file_id)  # don't strand the slot
+        await _release_file_slot(db, user, file_id)  # don't strand the slot
         raise
-    return await _enqueue(request, background, container, store, str(dest), user_key)
+    return await _enqueue(
+        request, background, container, store, str(dest), user_key,
+        max_chunks=limits.max_chunks, db=db, file_id=file_id,
+    )
 
 
 @router.get("/ingest/files", response_model=FileList)
-def list_files(
-    container: Container = Depends(get_container),
+async def list_files(
     user: AuthUser = Depends(get_current_user),
+    limits: Limits = Depends(effective_limits),
+    db=Depends(get_db),
 ) -> FileList:
-    user_key = user.tenant_id
-    limit = container.settings.api.max_files_per_user
-    r = container.redis
-    if r is None:
-        return FileList(files=[], used=0, limit=limit)
-    stored = r.hgetall(_files_key(user_key))
-    files = [
-        StoredFile(file_id=fid, name=Path(path).name, source=path)
-        for fid, path in stored.items()
-    ]
-    return FileList(files=sorted(files, key=lambda f: f.name), used=len(files), limit=limit)
+    owner = _account_uuid(user)
+    if db is None or owner is None:
+        return FileList(files=[], used=0, limit=limits.max_files)
+    async with session_scope(db) as s:
+        rows = (
+            await s.execute(
+                select(File).where(File.user_id == owner).order_by(File.created_at.desc())
+            )
+        ).scalars().all()
+    files = [StoredFile(file_id=f.id, name=f.name, source=f.path) for f in rows]
+    return FileList(files=files, used=len(files), limit=limits.max_files)
 
 
 @router.delete("/ingest/files/{file_id}", response_model=DeleteResponse)
-def delete_file(
+async def delete_file(
     file_id: str,
     container: Container = Depends(get_container),
     user: AuthUser = Depends(get_current_user),
+    db=Depends(get_db),
 ) -> DeleteResponse:
     """Remove an uploaded file, everything it put in the graph, and its slot."""
     user_key = user.tenant_id
-    r = container.redis
-    if r is None:
-        raise HTTPException(status_code=503, detail="File tracking needs Redis")
+    owner = _account_uuid(user)
+    if db is None or owner is None:
+        raise HTTPException(status_code=503, detail="File tracking needs a database")
 
-    # Look the path up in *this* user's set, so a file_id can't reach another
-    # tenant's document.
-    source = r.hget(_files_key(user_key), file_id)
-    if source is None:
-        raise HTTPException(status_code=404, detail=f"No such file: {file_id}")
+    # Look the row up scoped to *this* user, so a file_id from elsewhere
+    # cannot reach another tenant's document.
+    async with session_scope(db) as s:
+        row = (
+            await s.execute(
+                select(File).where(File.id == file_id, File.user_id == owner)
+            )
+        ).scalar_one_or_none()
+        if row is None:
+            raise HTTPException(status_code=404, detail=f"No such file: {file_id}")
+        source = row.path
+        await s.execute(delete(File).where(File.id == file_id, File.user_id == owner))
 
     tenant = container.tenant(user_key)
     removed = tenant.graph_store.delete_document(source)
     removed += tenant.vector_store.delete_source(source)  # no-op for Neo4j vectors
     Path(source).unlink(missing_ok=True)
-    _release_file_slot(container, user_key, file_id)
     log.info("file_deleted", user=user_key, file=file_id, chunks=removed)
     return DeleteResponse(file_id=file_id, chunks_removed=removed)
 
