@@ -420,6 +420,85 @@ class Neo4jGraphStore(GraphStore):
         )
         return [dict(r) for r in rows]
 
+    # -- inspection (admin) ---------------------------------------------------
+    def stats(self) -> dict[str, int]:
+        """Corpus-level counts for the admin panel.
+
+        One query with subqueries rather than four round trips — this is called
+        per user on a page that lists many of them.
+        """
+        rows = self._run(
+            """
+            CALL { MATCH (c:Chunk {corpus: $corpus}) RETURN count(c) AS chunks }
+            CALL { MATCH (e:Entity {corpus: $corpus}) RETURN count(e) AS entities }
+            CALL { MATCH (co:Community {corpus: $corpus}) RETURN count(co) AS communities }
+            CALL {
+                MATCH (a:Entity {corpus: $corpus})-[r]-(b:Entity {corpus: $corpus})
+                WHERE a.key < b.key
+                RETURN count(r) AS relations
+            }
+            CALL {
+                MATCH (c:Chunk {corpus: $corpus})
+                RETURN count(DISTINCT c.source) AS documents
+            }
+            RETURN chunks, entities, communities, relations, documents
+            """
+        )
+        if not rows:
+            return {
+                "chunks": 0, "entities": 0, "communities": 0,
+                "relations": 0, "documents": 0,
+            }
+        return {k: int(v or 0) for k, v in dict(rows[0]).items()}
+
+    def sample_subgraph(self, limit: int = 100) -> dict:
+        """A slice of the entity graph for visualization.
+
+        Ordered by degree so the sample shows the corpus's hubs — an arbitrary
+        `LIMIT` would usually return disconnected leaves and draw as dust.
+        """
+        limit = max(1, min(int(limit), 500))
+        nodes = self._run(
+            """
+            MATCH (e:Entity {corpus: $corpus})
+            OPTIONAL MATCH (e)-[r]-(:Entity {corpus: $corpus})
+            WITH e, count(r) AS degree
+            ORDER BY degree DESC
+            LIMIT $limit
+            RETURN e.key AS key, e.name AS name, e.type AS type, degree
+            """,
+            limit=limit,
+        )
+        keys = [r["key"] for r in nodes]
+        if not keys:
+            return {"nodes": [], "edges": []}
+        edges = self._run(
+            """
+            MATCH (a:Entity {corpus: $corpus})-[r]-(b:Entity {corpus: $corpus})
+            WHERE a.key IN $keys AND b.key IN $keys AND a.key < b.key
+            RETURN DISTINCT a.key AS source, b.key AS target, type(r) AS type
+            LIMIT 1000
+            """,
+            keys=keys,
+        )
+        return {
+            "nodes": [dict(r) for r in nodes],
+            "edges": [dict(r) for r in edges],
+        }
+
+    def purge_corpus(self) -> int:
+        """Delete everything belonging to this corpus. Used when an admin
+        removes a user; the tenant's storage should not outlive the account."""
+        rows = self._run(
+            """
+            MATCH (n {corpus: $corpus})
+            WITH n LIMIT 100000
+            DETACH DELETE n
+            RETURN count(n) AS removed
+            """
+        )
+        return int(rows[0]["removed"]) if rows else 0
+
 
 def _escape(query: str) -> str:
     """Escape Lucene special chars so a raw user query can't break the syntax."""

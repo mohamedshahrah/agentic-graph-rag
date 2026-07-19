@@ -225,6 +225,131 @@ class UsageReport(BaseModel):
     tokens: dict[str, int] = {}
 
 
+# --- admin -------------------------------------------------------------------
+
+class AdminUser(BaseModel):
+    id: str
+    email: str
+    role: str
+    status: str
+    tenant_id: str
+    created_at: str = ""
+    last_login_at: str | None = None
+    email_verified: bool = False
+    files: int = 0
+    threads: int = 0
+    messages_30d: int = 0
+    tokens_30d: int = 0
+
+
+class AdminUserList(BaseModel):
+    users: list[AdminUser] = []
+    total: int = 0
+    page: int = 1
+    size: int = 25
+
+
+class AdminUserDetail(BaseModel):
+    user: AdminUser
+    limits: dict[str, int] = {}
+    overrides: dict[str, int | None] = {}
+    usage: dict[str, int] = {}
+    storage_used_mb: float = 0.0
+    graph: dict[str, int] = {}
+    files: list[StoredFile] = []
+
+
+class UserPatch(BaseModel):
+    status: str | None = Field(None, description="active | suspended")
+    role: str | None = Field(None, description="user | admin")
+
+
+class LimitsPatch(BaseModel):
+    """Every field optional. Null clears an override back to the global default."""
+
+    messages_per_minute: int | None = None
+    messages_per_day: int | None = None
+    tokens_per_day: int | None = None
+    tokens_per_month: int | None = None
+    max_files: int | None = None
+    max_file_mb: int | None = None
+    max_storage_mb: int | None = None
+    max_chunks: int | None = None
+    max_threads: int | None = None
+
+
+class BulkLimits(BaseModel):
+    """Apply to every user at once. `clear` drops all per-user overrides so
+    everyone inherits the (possibly just-updated) global defaults."""
+
+    set: LimitsPatch | None = None
+    clear: bool = False
+
+
+class UsagePoint(BaseModel):
+    bucket: str
+    messages: int = 0
+    tokens: int = 0
+    uploads: int = 0
+
+
+class UsageSeries(BaseModel):
+    points: list[UsagePoint] = []
+    totals: dict[str, int] = {}
+
+
+class GraphNode(BaseModel):
+    key: str
+    name: str = ""
+    type: str = ""
+    degree: int = 0
+
+
+class GraphEdge(BaseModel):
+    source: str
+    target: str
+    type: str = ""
+
+
+class GraphSample(BaseModel):
+    nodes: list[GraphNode] = []
+    edges: list[GraphEdge] = []
+
+
+class SystemStatus(BaseModel):
+    version: str = ""
+    neo4j: bool = False
+    redis: bool = False
+    database: bool = False
+    users: int = 0
+    active_users: int = 0
+    threads: int = 0
+    files: int = 0
+    vector_provider: str = ""
+    memory_backend: str = ""
+    default_model: str = ""
+
+
+class ModelSettings(BaseModel):
+    """Which of the configured models the chat UI may offer."""
+
+    available: list[ModelOption] = []
+    enabled: list[str] = []
+
+
+class ModelSettingsUpdate(BaseModel):
+    enabled: list[str] = []
+
+
+class PurgeResult(BaseModel):
+    tenant_id: str = ""
+    graph_nodes: int = 0
+    files_removed: int = 0
+    vectors_removed: bool = False
+    rows_removed: bool = False
+    errors: list[str] = []
+
+
 class Health(BaseModel):
     status: str
     version: str

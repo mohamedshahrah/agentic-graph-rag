@@ -364,10 +364,20 @@ def create_app(container: Container | None = None) -> FastAPI:
     def metrics() -> Response:
         return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
-    from graphrag.api.routers import auth, health, ingest, query, search, threads, users
+    from graphrag.api.routers import (
+        admin,
+        auth,
+        health,
+        ingest,
+        query,
+        search,
+        threads,
+        users,
+    )
 
     app.include_router(health.router)
     app.include_router(auth.router)
+    app.include_router(admin.router)
     app.include_router(users.router)
     app.include_router(threads.router)
     app.include_router(ingest.router)
