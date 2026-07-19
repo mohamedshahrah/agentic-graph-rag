@@ -37,19 +37,27 @@ cp .env.example .env
 make up            # builds, starts, and applies migrations
 ```
 
-Then sign up in the browser, enter the code, and restart the API once so
-`GRAPHRAG_ADMIN_EMAIL` is promoted — or skip the restart:
+> **Set the database passwords *before* this first `make up`.** Postgres and
+> Neo4j bake their password in when their data volume is first created;
+> changing `.env` afterwards doesn't change the stored password and every
+> connection then fails auth. If you hit that, see
+> [Operations & troubleshooting](#operations--troubleshooting) below.
+
+Then sign up in the browser with the `GRAPHRAG_ADMIN_EMAIL` address, enter the
+code, and claim admin (no restart needed):
 
 ```bash
 make admin EMAIL=you@example.com
 ```
 
 Without an email provider configured, codes are written to the log instead of
-sent:
+sent — enough for a first boot or a single admin:
 
 ```bash
 docker compose logs api | grep "code is"
 ```
+
+For real users to receive codes, wire up [email delivery](#email-delivery-verification-codes).
 
 ## The two settings that decide whether you're exposed
 
@@ -64,6 +72,60 @@ on the wire, including session cookies and passwords.
 
 For a real deployment also remove the host `ports:` from the `api` and
 `frontend` services in `docker-compose.yml`, so only the proxy is reachable.
+
+## Email delivery (verification codes)
+
+Signup emails a 6-digit code that the account must enter before it activates.
+Where that code goes depends on config:
+
+- **No provider key** → the code is written to the API log
+  (`docker compose logs api | grep "code is"`). Fine for a first boot or a lone
+  admin; useless for real users.
+- **Resend or Brevo key set** → the code is emailed.
+
+Sending is best-effort: a signup never fails because the email API had a bad
+minute — the user is told to request a resend instead. An `email_send_failed`
+line in the log carries the provider's reason when one is rejected.
+
+### Resend
+
+1. Create a key at your Resend dashboard → **API Keys → Create API Key** (a
+   `re_…` string). Put it in `.env` as `RESEND_API_KEY=…`.
+2. Choose a sender address — this decides who can receive mail:
+   - **Testing** — `GRAPHRAG_EMAIL_FROM=Graph RAG <onboarding@resend.dev>`.
+     Works with just the key, no DNS. But Resend's shared sender only delivers
+     to the address your Resend account is registered under — enough to receive
+     your *own* admin code, not anyone else's.
+   - **Production** — verify a domain you own (Resend → **Domains → Add Domain**,
+     then add the DNS records it shows), and set
+     `GRAPHRAG_EMAIL_FROM=Graph RAG <noreply@yourdomain.com>`. Now codes reach
+     any address.
+3. Apply it — recreate, don't restart (see [troubleshooting](#operations--troubleshooting)):
+   ```bash
+   docker compose up -d --force-recreate api
+   ```
+
+On startup the API logs `email_provider_unconfigured` (falling back to console)
+if the key wasn't picked up — usually because the container was `restart`ed
+rather than recreated.
+
+Verify delivery without creating an account (swap in an address your sender can
+reach):
+
+```bash
+docker compose exec -T api python - <<'PY'
+import asyncio
+from graphrag.accounts.emails import build_email_sender
+from graphrag.config.loader import load_settings
+settings, secrets = load_settings()
+sender = build_email_sender(settings, secrets)
+print("sender:", type(sender).__name__, "from:", secrets.email_from)
+print("sent :", asyncio.run(sender.send("you@example.com", "Test", "It works.")))
+PY
+```
+
+`sender: ConsoleSender` means the key isn't active — check `RESEND_API_KEY` and
+that you recreated the container.
 
 ## Why ingest runs inside the API
 
@@ -102,6 +164,82 @@ tar czf data-$(date +%F).tar.gz data/
 `data/vectors/` holds one `.duckdb` file per tenant, so a single user can be
 restored without touching anyone else's. Restore has to be rehearsed to count —
 untested backups are a belief, not a policy.
+
+## Operations & troubleshooting
+
+### Changing `.env` needs a recreate, not a restart
+
+`docker compose restart api` reuses the container's existing environment — a new
+value in `.env` is silently ignored. To pick up **any** `.env` change (a key, a
+password, the sender address):
+
+```bash
+docker compose up -d --force-recreate api
+```
+
+This is behind most "I changed it but nothing happened" confusion here.
+
+### "password authentication failed" for user graphrag / neo4j
+
+Postgres and Neo4j read their password **only when their data volume is first
+created**. Changing `GRAPHRAG_POSTGRES_PASSWORD` / `GRAPHRAG_NEO4J_PASSWORD`
+afterwards doesn't touch the stored password — the app sends the new one and the
+database rejects it. Set them before the first `make up`. To fix a volume that's
+already out of sync:
+
+**Postgres** — reset the stored password in place (non-destructive):
+
+```bash
+docker compose exec -T postgres psql -U graphrag -d graphrag \
+  -c "ALTER USER graphrag WITH PASSWORD 'the-value-from-your-env';"
+docker compose up -d --force-recreate api
+```
+
+(The socket connection inside the container uses trust auth, so this works
+without knowing the old password.)
+
+**Neo4j** stores credentials in its system database — there's no in-place reset
+without the old password. If the graph holds nothing you need (for instance you
+never completed an ingest), recreate its volume so it reinitializes from `.env`:
+
+```bash
+docker compose rm -sf neo4j
+docker volume rm agentic-graph-rag_neo4j_data   # wipes the graph ONLY
+docker compose up -d neo4j
+docker compose up -d --force-recreate api
+```
+
+Postgres (accounts) and the DuckDB vectors are separate volumes and are
+untouched. If you *do* have graph data to keep, instead restart Neo4j once with
+`NEO4J_dbms_security_auth__enabled=false`, run `ALTER USER neo4j SET PASSWORD`,
+then remove that override and restart.
+
+### Uploads fail with a permission error
+
+The API runs as a non-root user; its entrypoint chowns the mounted `data/`
+directory on start so it can write uploads and the per-user DuckDB files. If
+uploads 500 with `PermissionError`, the entrypoint didn't run — check the image
+was built from the current `docker/Dockerfile` (it must have an `ENTRYPOINT`),
+and that `docker/entrypoint.sh` has LF line endings (a `.gitattributes` pins
+this; a Windows checkout without it can reintroduce CRLF).
+
+### Becoming admin / reaching the admin panel
+
+The admin area at `/admin` needs an account with the admin role.
+
+1. Sign up in the browser with the address in `GRAPHRAG_ADMIN_EMAIL`.
+2. Promote it (no restart needed):
+   ```bash
+   make admin EMAIL=you@example.com
+   # or: docker compose exec api graphrag promote-admin you@example.com
+   ```
+   Restarting the API also auto-promotes `GRAPHRAG_ADMIN_EMAIL` once that account
+   exists.
+3. Sign out and back in — an **Admin** link appears in the header.
+
+Break-glass: `GRAPHRAG_ADMIN_KEY` in `.env` reaches admin endpoints with an
+`X-Admin-Key` header even when no admin account exists — for bootstrap or
+recovery when you're locked out.
 
 ## Scaling past one box
 
