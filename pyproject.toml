@@ -30,7 +30,7 @@ dependencies = [
   "arq>=0.26",               # Redis-backed ingest queue (separate worker process)
   "langgraph-checkpoint-redis>=0.0.3",  # durable agent memory
   # --- agent / llm framework ---
-  "langgraph>=0.2.28",
+  "langgraph>=1.2",
   "langchain-core>=0.3",
   "langchain-text-splitters>=0.3",
   # --- providers (installed together for simplicity; swap freely via config) ---
@@ -71,7 +71,7 @@ local-models = [
 # API-only embedders / rerankers.
 extras = [
   "langchain-voyageai>=0.1",
-  "langchain-cohere>=0.3",
+  "cohere>=5.15",            # native SDK: embed-v4.0 + rerank-v4.0 controls
   "google-genai>=0.3",
 ]
 dev = [

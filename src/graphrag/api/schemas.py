@@ -29,6 +29,8 @@ class QueryRequest(BaseModel):
     thread_id: str = Field("default", description="conversation id for multi-turn memory")
     # None -> the server default (api.stream in config) decides.
     stream: bool | None = None
+    # Chat model id from the allowed list; unknown ids fall back to the default.
+    model: str | None = None
 
 
 class ToolCall(BaseModel):
@@ -56,6 +58,7 @@ class CompareRequest(BaseModel):
     aspects: list[str] = []
     style: str = "detailed"
     thread_id: str = "default"
+    model: str | None = None
 
 
 class IngestResponse(BaseModel):

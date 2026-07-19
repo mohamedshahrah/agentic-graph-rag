@@ -79,9 +79,9 @@ def build_checkpointer(
 class AgentSession:
     """One question in flight. Holds the per-query source collector."""
 
-    def __init__(self, agent, styled_question: str, config: dict, ctx: ToolContext) -> None:
+    def __init__(self, agent, question: str, config: dict, ctx: ToolContext) -> None:
         self._agent = agent
-        self._input = {"messages": [HumanMessage(content=styled_question)]}
+        self._input = {"messages": [HumanMessage(content=question)]}
         self._config = config
         self._ctx = ctx
 
@@ -166,19 +166,31 @@ class AgentRunner:
         # final answer step. This is what bounds a looping agent.
         self._recursion_limit = 2 * max(1, max_tool_iterations) + 1
 
-    def _make_agent(self, ctx: ToolContext):
+    def _make_agent(
+        self, ctx: ToolContext, style: str | None, model: BaseChatModel | None = None
+    ):
         tools = build_tools(ctx)
+        # The style instruction lives in the system prompt, not the human turn:
+        # everything on the system side is ours, everything on the human side is
+        # the user's question and nothing else. `style_instruction` clamps to
+        # the AnswerStyle enum, so no free-form text can ride in on it.
+        prompt = SYSTEM_PROMPT.format(style=style_instruction(style or self._default_style))
+        chat = model or self._model
         try:
             return create_react_agent(
-                self._model, tools, prompt=SYSTEM_PROMPT, checkpointer=self._checkpointer
+                chat, tools, prompt=prompt, checkpointer=self._checkpointer
             )
         except TypeError:  # older langgraph uses state_modifier
             return create_react_agent(
-                self._model, tools, state_modifier=SYSTEM_PROMPT, checkpointer=self._checkpointer
+                chat, tools, state_modifier=prompt, checkpointer=self._checkpointer
             )
 
     def session(
-        self, question: str, style: str | None = None, thread_id: str = "default"
+        self,
+        question: str,
+        style: str | None = None,
+        thread_id: str = "default",
+        model: BaseChatModel | None = None,
     ) -> AgentSession:
         ctx = ToolContext(
             vector=self._vector,
@@ -188,11 +200,9 @@ class AgentRunner:
             top_k=self._top_k,
             graph_hops=self._graph_hops,
         )
-        agent = self._make_agent(ctx)
-        instruction = style_instruction(style or self._default_style)
-        styled = f"{instruction}\n\nQuestion: {question}"
+        agent = self._make_agent(ctx, style, model)
         config = {
             "configurable": {"thread_id": thread_id},
             "recursion_limit": self._recursion_limit,
         }
-        return AgentSession(agent, styled, config, ctx)
+        return AgentSession(agent, question, config, ctx)

@@ -70,6 +70,32 @@ def build_chat_model(
                 max_output_tokens=max_tokens,
                 **extra,
             )
+        if provider == "deepseek":
+            # OpenAI-compatible endpoint. Use the v4 names (deepseek-v4-flash /
+            # deepseek-v4-pro) — the old deepseek-chat/-reasoner aliases were
+            # retired July 2026.
+            from langchain_openai import ChatOpenAI
+
+            return ChatOpenAI(
+                model=model,
+                api_key=secrets.deepseek_api_key,
+                base_url="https://api.deepseek.com/v1",
+                temperature=temperature,
+                max_tokens=max_tokens,
+                **extra,
+            )
+        if provider == "qwen":
+            # Alibaba DashScope, OpenAI-compatible mode (qwen3.6-plus / -flash).
+            from langchain_openai import ChatOpenAI
+
+            return ChatOpenAI(
+                model=model,
+                api_key=secrets.dashscope_api_key,
+                base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+                temperature=temperature,
+                max_tokens=max_tokens,
+                **extra,
+            )
     except ImportError as exc:  # pragma: no cover
         raise ProviderError(f"LLM provider '{provider}' package is not installed") from exc
 

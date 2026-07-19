@@ -54,9 +54,11 @@ def build_api_embedder(cfg: EmbeddingCfg, secrets: Secrets) -> Embedder:
 
             backend = VoyageAIEmbeddings(model=cfg.model, api_key=secrets.voyage_api_key)
         elif provider == "cohere":
-            from langchain_cohere import CohereEmbeddings
+            # Native SDK, not the LangChain wrapper: embed-v4.0 needs
+            # input_type and output_dimension, which the wrapper doesn't expose.
+            from graphrag.embeddings.cohere_native import CohereEmbedder
 
-            backend = CohereEmbeddings(model=cfg.model, cohere_api_key=secrets.cohere_api_key)
+            return CohereEmbedder(cfg, secrets.cohere_api_key)
         else:
             raise ProviderError(f"Unknown embedding provider: {provider}")
     except ImportError as exc:  # pragma: no cover

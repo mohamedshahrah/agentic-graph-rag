@@ -133,6 +133,7 @@ class APIReranker(Reranker):
         self._provider = provider
         self._model = model
         self._secrets = secrets
+        self._client = None
 
     def rerank(self, query, chunks, top_k):
         if not chunks:
@@ -142,8 +143,12 @@ class APIReranker(Reranker):
             if self._provider == "cohere":
                 import cohere
 
-                client = cohere.Client(api_key=self._secrets.cohere_api_key)
-                resp = client.rerank(model=self._model, query=query, documents=docs, top_n=top_k)
+                # ClientV2 — the v1 client predates the rerank-v4.0 models.
+                if self._client is None:
+                    self._client = cohere.ClientV2(api_key=self._secrets.cohere_api_key)
+                resp = self._client.rerank(
+                    model=self._model, query=query, documents=docs, top_n=top_k
+                )
                 order = [(r.index, r.relevance_score) for r in resp.results]
             elif self._provider == "voyage":
                 import voyageai

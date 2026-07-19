@@ -10,12 +10,23 @@ app:
 
 # --- Reply LLM (the agent) ----------------------------------------------------
 llm:
-  provider: ollama            # ollama | anthropic | openai | gemini
+  # ollama | anthropic | openai | gemini | deepseek | qwen
+  # deepseek and qwen are OpenAI-compatible endpoints (api.deepseek.com,
+  # DashScope compatible-mode); they need DEEPSEEK_API_KEY / DASHSCOPE_API_KEY.
+  provider: ollama
   model: qwen2.5:7b-instruct
   temperature: 0.1
   max_tokens: 2048
   # Extra provider kwargs pass straight through to the LangChain chat model.
+  # Applied to this model only — a per-request model override doesn't inherit
+  # them, since they're model-specific (e.g. Anthropic thinking).
   extra: {}
+  # Models the chat UI may select per request. Empty -> the model above is the
+  # only choice. A request naming anything not on this list silently falls back
+  # to the default, so a stale UI selection can't reach an arbitrary provider.
+  allowed: []
+  #  - { provider: gemini, model: gemini-3.5-flash, label: "Gemini 3.5 Flash", default: true }
+  #  - { provider: qwen,   model: qwen3.6-flash,    label: "Qwen 3.6 Flash" }
 
 # --- Embeddings (rich control — see docs/CONFIGURATION.md) ---------------------
 embeddings:
@@ -75,12 +86,19 @@ storage:
     provider: neo4j
     database: neo4j
   vector:
-    provider: neo4j           # neo4j: vectors on :Chunk nodes, native ANN index
-                              # local: exact numpy search over files in local_dir
-                              #        (no service; fine to ~100k chunks/corpus)
+    provider: neo4j           # neo4j:  vectors on :Chunk nodes, native ANN index
+                              # local:  exact numpy search over files in local_dir
+                              #         (no service; fine to ~100k chunks/corpus)
+                              # duckdb: one embedded DB file per user under
+                              #         duckdb_dir — real per-user isolation,
+                              #         exact cosine scan. Single-process only:
+                              #         the API must own the files (no separate
+                              #         ingest worker), see docs/DEPLOYMENT.md.
     index_name: chunk_embeddings
     similarity: cosine
     local_dir: data/vectors   # only used by provider: local
+    duckdb_dir: data/vectors  # only used by provider: duckdb
+    memory_limit_mb: 256      # DuckDB per-connection memory cap
 
 # --- Retrieval ----------------------------------------------------------------
 retrieval:
@@ -110,7 +128,12 @@ retrieval:
 
 # --- Agent --------------------------------------------------------------------
 agent:
-  memory: true                # multi-turn memory via Redis checkpointer
+  memory: true                # multi-turn memory (durable checkpointer)
+  memory_backend: redis       # redis    needs redis-stack (RediSearch modules)
+                              # postgres needs GRAPHRAG_DATABASE_URL; lets plain
+                              #          redis:7 serve cache/queue/limits
+                              # Either way, an unreachable backend degrades to
+                              # in-process memory rather than failing requests.
   max_tool_iterations: 6
   default_style: detailed     # concise | detailed | technical | eli5
 

@@ -31,6 +31,7 @@ async def sse_answer(
     thread_id: str,
     user_id: str | None = None,
     redis_client=None,
+    model=None,
 ) -> AsyncIterator[dict]:
     sources = []
     started = time.perf_counter()
@@ -39,7 +40,7 @@ async def sse_answer(
     log.info("stream_started", question=question[:80], style=style, user=user_id or "-")
     try:
         async for kind, data, srcs in service.stream(
-            question, style=style, thread_id=thread_id, user_id=user_id
+            question, style=style, thread_id=thread_id, user_id=user_id, model=model
         ):
             sources = srcs
             if kind == "tool":

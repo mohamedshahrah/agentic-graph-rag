@@ -92,6 +92,7 @@ class Container:
         configure_logging(settings.app.log_level)
         self._tenants: OrderedDict[str, Tenant] = OrderedDict()
         self._ready_dbs: set[str] = set()
+        self._chat_models: dict[tuple[str, str], object] = {}
         self._redis_client = None
         self._redis_checked_at = 0.0
         # The API flips this to True before serving so the checkpointer is built
@@ -160,6 +161,23 @@ class Container:
             c.provider, c.model, self.secrets,
             temperature=c.temperature, max_tokens=c.max_tokens, extra=c.extra,
         )
+
+    def chat_model(self, provider: str, model: str):
+        """A chat model for an explicit, registry-validated (provider, model)
+        pair, cached per pair. The default pair reuses `llm` so extraction and
+        chat share one client. Provider `extra` kwargs (e.g. Anthropic
+        thinking) apply only to the configured default — they are model-
+        specific and must not leak onto overrides."""
+        c = self.settings.llm
+        if (provider, model) == (c.provider, c.model):
+            return self.llm
+        key = (provider, model)
+        if key not in self._chat_models:
+            self._chat_models[key] = build_chat_model(
+                provider, model, self.secrets,
+                temperature=c.temperature, max_tokens=c.max_tokens,
+            )
+        return self._chat_models[key]
 
     @cached_property
     def extractor_llm(self):

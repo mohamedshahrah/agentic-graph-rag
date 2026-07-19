@@ -20,12 +20,17 @@ class QueryService:
         return self._c.settings
 
     def _session(
-        self, question: str, style: str | None, thread_id: str, user_id: str | None
+        self,
+        question: str,
+        style: str | None,
+        thread_id: str,
+        user_id: str | None,
+        model=None,
     ) -> AgentSession:
         tenant = self._c.tenant(user_id)
         # Namespace the memory thread with the user so conversations stay private.
         return tenant.agent.session(
-            question, style=style, thread_id=f"{tenant.user_id}:{thread_id}"
+            question, style=style, thread_id=f"{tenant.user_id}:{thread_id}", model=model
         )
 
     def answer(
@@ -34,9 +39,10 @@ class QueryService:
         style: str | None = None,
         thread_id: str = "default",
         user_id: str | None = None,
+        model=None,
     ) -> QueryResult:
         """Blocking — for the CLI and scripts (sync checkpointer)."""
-        return self._session(question, style, thread_id, user_id).run()
+        return self._session(question, style, thread_id, user_id, model).run()
 
     async def aanswer(
         self,
@@ -44,9 +50,10 @@ class QueryService:
         style: str | None = None,
         thread_id: str = "default",
         user_id: str | None = None,
+        model=None,
     ) -> QueryResult:
         """Async — the API's non-streaming path (async checkpointer)."""
-        return await self._session(question, style, thread_id, user_id).arun()
+        return await self._session(question, style, thread_id, user_id, model).arun()
 
     async def stream(
         self,
@@ -54,9 +61,10 @@ class QueryService:
         style: str | None = None,
         thread_id: str = "default",
         user_id: str | None = None,
+        model=None,
     ) -> AsyncIterator[tuple[str, str, list[RetrievedChunk]]]:
         """Yield (kind, data, sources) — kind is "token" or "tool"."""
-        session = self._session(question, style, thread_id, user_id)
+        session = self._session(question, style, thread_id, user_id, model)
         async for kind, data in session.astream_events():
             yield kind, data, session.sources
 

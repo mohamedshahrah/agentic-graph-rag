@@ -2,14 +2,24 @@
 
 from __future__ import annotations
 
+import hashlib
+
 from graphrag.config.settings import EntityResolutionCfg
 from graphrag.ingestion.enrich import _contained, _UnionFind, resolve_entities
 
 
 class _FakeEmbedder:
-    """Deterministic embeddings: identical names are identical vectors."""
+    """Deterministic embeddings: identical names are identical vectors, and
+    different names are near-orthogonal.
 
-    dim = 4
+    Two details matter. `hashlib`, not `hash()`: the builtin is salted per
+    process, so vectors changed between runs. And bytes are centered to
+    [-1, 1) rather than kept positive: vectors confined to one octant have a
+    cosine similarity around 0.9 by chance, which crossed the 0.93 merge
+    threshold on unlucky seeds and merged unrelated entities.
+    """
+
+    dim = 16
 
     def embed_documents(self, texts):
         return [self._vec(t) for t in texts]
@@ -19,8 +29,8 @@ class _FakeEmbedder:
 
     @staticmethod
     def _vec(text: str):
-        h = abs(hash(text.lower()))
-        return [((h >> (8 * i)) % 100) / 100.0 + 0.01 for i in range(4)]
+        digest = hashlib.sha256(text.lower().encode()).digest()
+        return [(b - 127.5) / 127.5 for b in digest[:16]]
 
 
 class _FakeGraph:

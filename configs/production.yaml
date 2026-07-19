@@ -1,0 +1,55 @@
+# Production profile: cloud APIs only, sized for a small VPS (2 vCPU / 8 GB).
+# No torch, no local models — chat/OCR via Gemini (+ DeepSeek/Qwen selectable),
+# embeddings + rerank via Cohere. Set the matching keys in .env:
+#   GOOGLE_API_KEY     (chat default + OCR)
+#   COHERE_API_KEY     (embeddings + rerank)
+#   DEEPSEEK_API_KEY   (optional chat provider)
+#   DASHSCOPE_API_KEY  (optional chat provider, Qwen)
+llm:
+  provider: gemini
+  model: gemini-3.5-flash
+  max_tokens: 4096
+  # What the chat UI's model selector may pick. Requests naming anything else
+  # fall back to the default. The admin panel can narrow this list further.
+  allowed:
+    - { provider: gemini,   model: gemini-3.5-flash,      label: "Gemini 3.5 Flash", default: true }
+    - { provider: gemini,   model: gemini-3.1-flash-lite, label: "Gemini Flash Lite" }
+    - { provider: deepseek, model: deepseek-v4-flash,     label: "DeepSeek V4 Flash" }
+    - { provider: qwen,     model: qwen3.6-plus,          label: "Qwen 3.6 Plus" }
+    - { provider: qwen,     model: qwen3.6-flash,         label: "Qwen 3.6 Flash" }
+
+embeddings:
+  provider: cohere
+  model: embed-v4.0
+  # embed-v4.0 is Matryoshka-trained: 1024 of the native 1536 dims keeps
+  # nearly all retrieval quality at two-thirds the vector storage.
+  dimensions: 1024
+  tokenizer: BAAI/bge-m3   # HF tokenizer for chunk sizing only (Cohere's isn't on HF)
+
+ocr:
+  engine: vision_llm
+  vision_llm:
+    provider: gemini
+    model: gemini-3.1-flash-lite
+
+retrieval:
+  rerank:
+    provider: cohere
+    model: rerank-v4.0-fast
+
+storage:
+  vector:
+    provider: duckdb        # per-user DuckDB file under duckdb_dir (Phase 2)
+    duckdb_dir: data/vectors
+    memory_limit_mb: 256
+
+agent:
+  memory: true
+  memory_backend: postgres  # chat memory in Postgres (Phase 2); redis for dev
+
+ingestion:
+  # Ingest runs in-process on the API box; keep extraction from starving chat.
+  max_concurrency: 2
+
+auth:
+  enabled: false            # flipped to true when the account system ships (Phase 5)
