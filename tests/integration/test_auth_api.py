@@ -38,7 +38,6 @@ async def client(db, email_sender):
     """
     container = Container()
     container.settings.auth.enabled = True
-    container.settings.auth.cookie_secure = False  # the test transport is http
     container.settings.storage.vector.provider = "duckdb"
 
     app = create_app(container)
@@ -73,6 +72,20 @@ async def test_signup_verify_sets_a_hardened_session_cookie(client, email_sender
     # from attaching it to cross-site POSTs.
     assert "httponly" in raw.lower()
     assert "samesite=lax" in raw.lower()
+    # This request arrived over plain http, so Secure must be off — with it on
+    # the browser would discard the cookie and sign-in would fail silently.
+    assert "secure" not in raw.lower()
+
+
+async def test_https_requests_get_a_secure_cookie(client, email_sender):
+    """The mirror of the above: behind a TLS proxy the flag must be set."""
+    await client.post("/auth/signup", json={"email": EMAIL, "password": PASSWORD})
+    r = await client.post(
+        "/auth/verify",
+        json={"email": EMAIL, "code": email_sender.last_code(EMAIL)},
+        headers={"X-Forwarded-Proto": "https"},
+    )
+    assert "secure" in r.headers["set-cookie"].lower()
 
 
 async def test_protected_routes_reject_anonymous_callers(client):

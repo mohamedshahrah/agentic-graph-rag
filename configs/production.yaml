@@ -52,4 +52,13 @@ ingestion:
   max_concurrency: 2
 
 auth:
-  enabled: false            # flipped to true when the account system ships (Phase 5)
+  enabled: true             # sessions or API keys required; X-User-Id ignored
+  open_registration: true   # false -> only an admin can create accounts
+  session_ttl_days: 30
+  # auto: the Secure flag follows the request scheme, so HTTPS is protected and
+  # a plain-HTTP deployment still works. Pin to true once TLS is guaranteed.
+  cookie_secure: auto
+  email:
+    # console logs codes to the server log (dev). Set RESEND_API_KEY or
+    # BREVO_API_KEY and switch this to actually deliver them.
+    provider: resend

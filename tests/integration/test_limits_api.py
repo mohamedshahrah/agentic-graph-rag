@@ -55,7 +55,6 @@ async def client(db, email_sender):
     isolated per test — a shared Redis would leak windows between them."""
     container = Container()
     container.settings.auth.enabled = True
-    container.settings.auth.cookie_secure = False
     container.settings.storage.vector.provider = "duckdb"
 
     app = create_app(container)

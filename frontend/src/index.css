@@ -1,9 +1,134 @@
+@import "@fontsource-variable/inter";
+
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
 
-html,
-body,
-#root {
-  height: 100%;
+/* Two palettes, one set of names. Channels (not hex) so Tailwind's
+   <alpha-value> works and every color can be used at partial opacity.
+
+   The neutrals carry a slight blue cast and the accent is a restrained
+   indigo — enough to mark interactive elements without the saturated
+   purple-to-blue gradients that make an interface look generated. */
+@layer base {
+  :root {
+    --canvas: 249 250 251;
+    --surface: 255 255 255;
+    --raised: 243 244 246;
+    --border: 226 230 235;
+    --text-strong: 17 24 39;
+    --text-body: 55 65 81;
+    --text-muted: 122 132 148;
+    --accent: 79 70 229;
+    --accent-soft: 238 238 253;
+    --accent-text: 255 255 255;
+    --positive: 22 143 96;
+    --caution: 191 129 20;
+    --danger: 205 58 58;
+    color-scheme: light;
+  }
+
+  :root.dark {
+    --canvas: 14 16 20;
+    --surface: 22 25 31;
+    --raised: 31 35 43;
+    --border: 45 50 60;
+    --text-strong: 244 246 249;
+    --text-body: 203 210 220;
+    --text-muted: 138 147 161;
+    --accent: 129 122 245;
+    --accent-soft: 39 38 66;
+    --accent-text: 12 12 20;
+    --positive: 60 190 133;
+    --caution: 226 172 63;
+    --danger: 240 112 112;
+    color-scheme: dark;
+  }
+
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+
+  body {
+    @apply bg-canvas text-body antialiased;
+    font-feature-settings: "cv02", "cv03", "cv04", "cv11";
+  }
+
+  /* Visible focus for keyboard users, invisible for mouse users. */
+  :focus-visible {
+    @apply outline-none ring-2 ring-accent/60 ring-offset-2 ring-offset-canvas;
+  }
+
+  ::selection {
+    @apply bg-accent/20;
+  }
+
+  /* A scrollbar that recedes; the default light-on-dark one is jarring. */
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: rgb(var(--border)) transparent;
+  }
+  ::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+  ::-webkit-scrollbar-thumb {
+    @apply rounded-full border-4 border-solid border-transparent bg-clip-padding;
+    background-color: rgb(var(--border));
+  }
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+}
+
+@layer components {
+  /* Markdown answers. Tailwind's typography plugin would be another
+     dependency for one surface, so the handful of rules it needs live here. */
+  .prose-answer {
+    @apply text-[15px] leading-relaxed text-body;
+  }
+  .prose-answer > * + * {
+    @apply mt-3;
+  }
+  .prose-answer h1,
+  .prose-answer h2,
+  .prose-answer h3 {
+    @apply mt-5 font-semibold text-strong;
+  }
+  .prose-answer h1 { @apply text-lg; }
+  .prose-answer h2 { @apply text-base; }
+  .prose-answer h3 { @apply text-[15px]; }
+  .prose-answer ul { @apply list-disc space-y-1 pl-5; }
+  .prose-answer ol { @apply list-decimal space-y-1 pl-5; }
+  .prose-answer a { @apply text-accent underline underline-offset-2; }
+  .prose-answer strong { @apply font-semibold text-strong; }
+  .prose-answer blockquote {
+    @apply border-l-2 border-border pl-3 text-muted;
+  }
+  .prose-answer code {
+    @apply rounded bg-raised px-1 py-0.5 font-mono text-[13px] text-strong;
+  }
+  .prose-answer pre {
+    @apply overflow-x-auto rounded-lg border border-border bg-raised p-3;
+  }
+  .prose-answer pre code {
+    @apply bg-transparent p-0 text-[13px] leading-relaxed;
+  }
+  .prose-answer table {
+    @apply block w-full overflow-x-auto border-collapse text-sm;
+  }
+  .prose-answer th,
+  .prose-answer td {
+    @apply border border-border px-3 py-1.5 text-left align-top;
+  }
+  .prose-answer th { @apply bg-raised font-semibold text-strong; }
+
+  /* Syntax highlighting, themed from the same variables. */
+  .hljs-comment, .hljs-quote { @apply italic text-muted; }
+  .hljs-keyword, .hljs-selector-tag, .hljs-literal { color: rgb(var(--accent)); }
+  .hljs-string, .hljs-attr { color: rgb(var(--positive)); }
+  .hljs-number, .hljs-built_in { color: rgb(var(--caution)); }
+  .hljs-title, .hljs-section { @apply font-semibold text-strong; }
 }

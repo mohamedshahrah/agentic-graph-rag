@@ -25,9 +25,33 @@ from graphrag.db.models import Base, GlobalLimit
 
 DSN_ENV = "GRAPHRAG_TEST_DATABASE_URL"
 
+# These fixtures drop every table between runs, so the database they point at
+# must be disposable. Requiring the name to say so is a cheap guard against the
+# afternoon someone exports a real DSN and loses their accounts table.
+_TEST_MARKERS = ("test", "tmp", "scratch", "ci")
+
 
 def _dsn() -> str | None:
     return os.getenv(DSN_ENV) or os.getenv("GRAPHRAG_DATABASE_URL")
+
+
+def _database_name(dsn: str) -> str:
+    return dsn.rsplit("/", 1)[-1].split("?")[0].lower()
+
+
+def _checked_dsn() -> str | None:
+    dsn = _dsn()
+    if dsn is None:
+        return None
+    name = _database_name(dsn)
+    if not any(marker in name for marker in _TEST_MARKERS):
+        pytest.fail(
+            f"Refusing to run destructive tests against database {name!r}: these "
+            f"fixtures drop every table. Point {DSN_ENV} at a database whose name "
+            f"contains one of {_TEST_MARKERS}.",
+            pytrace=False,
+        )
+    return dsn
 
 
 requires_db = pytest.mark.skipif(
@@ -50,7 +74,7 @@ def event_loop():
 
 @pytest_asyncio.fixture
 async def engine():
-    dsn = _dsn()
+    dsn = _checked_dsn()
     if dsn is None:
         pytest.skip(f"set {DSN_ENV}")
     eng = build_engine(dsn)

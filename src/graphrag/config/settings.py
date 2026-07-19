@@ -207,9 +207,13 @@ class AuthCfg(BaseModel):
     # forced.
     otp_ttl_minutes: int = 15
     otp_max_attempts: int = 5
-    # Set false only when serving over plain HTTP (the cookie won't be sent
-    # back over http:// while this is true).
-    cookie_secure: bool = True
+    # auto | true | false. A Secure cookie is ignored by the browser over
+    # plain http://, which makes sign-in fail silently — and the shipped
+    # compose defaults to :80. `auto` sets the flag per request from the
+    # scheme (honouring X-Forwarded-Proto from the proxy), so HTTPS gets the
+    # protection and an HTTP deployment still works. Pin it to true once you
+    # are certain every request arrives over TLS.
+    cookie_secure: str = "auto"
     email: EmailCfg = Field(default_factory=EmailCfg)
 
 

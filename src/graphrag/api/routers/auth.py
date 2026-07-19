@@ -50,14 +50,26 @@ log = get_logger(__name__)
 _SENT = "If that address can be registered, we've sent a code to it."
 
 
-def _set_session_cookie(response: Response, token: str, container: Container) -> None:
+def _is_secure(request: Request) -> bool:
+    """Did this request arrive over TLS? Trusts X-Forwarded-Proto, which the
+    bundled Caddy/nginx set — without it every request looks like plain HTTP
+    from behind a proxy."""
+    forwarded = request.headers.get("X-Forwarded-Proto", "").split(",")[0].strip()
+    return (forwarded or request.url.scheme) == "https"
+
+
+def _set_session_cookie(
+    response: Response, token: str, container: Container, request: Request
+) -> None:
     auth = container.settings.auth
+    configured = str(auth.cookie_secure).lower()
+    secure = _is_secure(request) if configured == "auto" else configured in ("1", "true", "yes")
     response.set_cookie(
         SESSION_COOKIE,
         token,
         max_age=auth.session_ttl_days * 86400,
         httponly=True,
-        secure=auth.cookie_secure,
+        secure=secure,
         samesite="lax",
         path="/",
     )
@@ -112,6 +124,7 @@ async def resend(
 @router.post("/verify", response_model=Me)
 async def verify(
     payload: VerifyRequest,
+    request: Request,
     response: Response,
     accounts: AccountService = Depends(get_accounts),
     container: Container = Depends(get_container),
@@ -122,7 +135,7 @@ async def verify(
         raise HTTPException(
             status_code=400, detail={"code": exc.code, "message": str(exc)}
         ) from None
-    _set_session_cookie(response, token, container)
+    _set_session_cookie(response, token, container, request)
     return _me(principal, container)
 
 
@@ -148,7 +161,7 @@ async def login(
         raise HTTPException(
             status_code=status, detail={"code": exc.code, "message": str(exc)}
         ) from None
-    _set_session_cookie(response, token, container)
+    _set_session_cookie(response, token, container, request)
     return _me(principal, container)
 
 

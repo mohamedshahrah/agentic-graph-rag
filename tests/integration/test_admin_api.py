@@ -31,7 +31,6 @@ ADMIN_HEADERS = {"X-Admin-Key": ADMIN_KEY}
 async def client(db, email_sender):
     container = Container()
     container.settings.auth.enabled = True
-    container.settings.auth.cookie_secure = False
     container.settings.storage.vector.provider = "duckdb"
     container.secrets.admin_api_key = ADMIN_KEY
 

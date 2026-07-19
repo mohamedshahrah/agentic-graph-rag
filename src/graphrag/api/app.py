@@ -336,6 +336,19 @@ def create_app(container: Container | None = None) -> FastAPI:
                 note="auth is on but neither GRAPHRAG_ADMIN_KEY nor "
                      "GRAPHRAG_ADMIN_EMAIL is set — the admin panel is unreachable",
             )
+    else:
+        # Worth shouting about. With auth off, the X-User-Id header *is* the
+        # identity: anyone who can reach this port can read and write any
+        # tenant's data. That's the intended local-development behavior and a
+        # serious mistake in production, and the two look identical in a log
+        # unless one of them says so.
+        log.warning(
+            "auth_disabled",
+            profile=container.secrets.profile,
+            note="ANY caller can act as ANY user via the X-User-Id header. "
+                 "Set GRAPHRAG_PROFILE=production (or auth.enabled: true) "
+                 "before exposing this server.",
+        )
 
     # Rate limiting (per credential / IP). Redis-backed when available so
     # limits hold across API replicas; in-memory otherwise.
