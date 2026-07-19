@@ -40,6 +40,14 @@ export default function Chat() {
 
   const bottomRef = useRef<HTMLDivElement>(null);
   const abortRef = useRef<AbortController | null>(null);
+  // send() creates a thread inline and navigates to it, which fires the
+  // transcript-load effect below for a thread whose first message isn't
+  // persisted yet. Without this, that effect loads an empty transcript and
+  // resets `turns` to [] mid-stream — and the next streamed token then reads
+  // `.content` off an undefined turn and crashes the whole view. This holds the
+  // id we're actively streaming into so the effect leaves its optimistic turns
+  // alone.
+  const streamingRef = useRef<string | null>(null);
 
   useEffect(() => localStorage.setItem(STYLE_KEY, style), [style]);
   useEffect(() => localStorage.setItem(MODEL_KEY, model), [model]);
@@ -61,10 +69,24 @@ export default function Chat() {
   // Load a conversation's transcript when the route changes. History lives on
   // the server now, so a reload or another device shows the same thing.
   useEffect(() => {
+    // Leaving a thread that's still streaming: abort it so its remaining tokens
+    // don't land in whatever thread we're about to show. send()'s own teardown
+    // is guarded, so this early cleanup won't fight a stream started afterward.
+    if (streamingRef.current && streamingRef.current !== threadId) {
+      abortRef.current?.abort();
+      abortRef.current = null;
+      streamingRef.current = null;
+      setBusy(false);
+    }
+
     if (!threadId) {
       setTurns([]);
       return;
     }
+    // We just created this thread in send() and are streaming into it; its
+    // optimistic turns are live and its first message isn't saved yet. Don't
+    // reload it out from under the stream.
+    if (streamingRef.current === threadId) return;
     let cancelled = false;
     (async () => {
       try {
@@ -110,6 +132,7 @@ export default function Chat() {
   function stop() {
     abortRef.current?.abort();
     abortRef.current = null;
+    streamingRef.current = null;
     setBusy(false);
   }
 
@@ -130,6 +153,9 @@ export default function Chat() {
         const thread = await threadsApi.create();
         setThreads((prev) => [thread, ...prev]);
         id = thread.id;
+        // Mark before navigating so the load effect this navigation triggers
+        // skips the reload instead of wiping our optimistic turns.
+        streamingRef.current = id;
         navigate(`/chat/${thread.id}`, { replace: true });
       } catch (err) {
         setBusy(false);
@@ -139,13 +165,18 @@ export default function Chat() {
       }
     }
 
+    streamingRef.current = id;
     setTurns((prev) => [...prev, { role: "user", content: question }, { role: "assistant", content: "" }]);
 
     const controller = new AbortController();
     abortRef.current = controller;
 
+    // Every stream updater guards against an empty `turns`: state resets can
+    // still race the stream, and a token must never read `.content` off an
+    // undefined turn.
     const patchLast = (patch: Partial<Turn>) =>
       setTurns((prev) => {
+        if (prev.length === 0) return prev;
         const next = [...prev];
         next[next.length - 1] = { ...next[next.length - 1], ...patch };
         return next;
@@ -158,6 +189,7 @@ export default function Chat() {
         id,
         (token) =>
           setTurns((prev) => {
+            if (prev.length === 0) return prev;
             const next = [...prev];
             const last = next[next.length - 1];
             next[next.length - 1] = {
@@ -187,8 +219,14 @@ export default function Chat() {
         });
       }
     } finally {
-      abortRef.current = null;
-      setBusy(false);
+      // Only tear down if we still own the live stream. A thread switch or the
+      // stop button may have already aborted us — and by now a newer stream
+      // could be running, whose refs and busy state we must not clobber.
+      if (abortRef.current === controller) {
+        abortRef.current = null;
+        streamingRef.current = null;
+        setBusy(false);
+      }
     }
   }
 
