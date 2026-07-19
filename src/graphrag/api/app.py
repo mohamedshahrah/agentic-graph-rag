@@ -6,6 +6,7 @@ Interactive testing UI is auto-generated at /docs (Swagger) and /redoc.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import time
 import uuid
@@ -13,6 +14,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from prometheus_client import CONTENT_TYPE_LATEST, Counter, Histogram, generate_latest
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
@@ -20,7 +22,6 @@ from slowapi.middleware import SlowAPIMiddleware
 from slowapi.util import get_remote_address
 
 from graphrag import __version__
-from graphrag.auth import KeyStore
 from graphrag.container import Container
 from graphrag.core.logging import get_logger
 from graphrag.jobs import JobStore
@@ -38,20 +39,57 @@ _LATENCY = Histogram(
 
 
 def _rate_key(request: Request) -> str:
-    """Rate-limit bucket key. With auth on, the bucket is the *verified* user —
-    never a header the caller invents, which would let one client mint a fresh
-    bucket per request. Dev mode trusts X-User-Id (that's what it's for)."""
+    """Rate-limit bucket key.
+
+    With auth on, the bucket must not be anything the caller can invent — a
+    client that picks its own bucket gets a fresh quota per request. The
+    session cookie and API key are both server-issued, so hashing them is
+    safe *and* cheap: this runs on every request, so it deliberately avoids
+    the database lookup that resolving them to a user id would need.
+
+    Dev mode trusts X-User-Id (that's what it's for).
+    """
     container: Container = request.app.state.container
     if container.settings.auth.enabled:
-        from graphrag.api.deps import extract_key
+        from graphrag.api.deps import SESSION_COOKIE, extract_key
 
-        key = extract_key(request)
-        if key:
-            user = request.app.state.key_store.resolve(key)
-            if user:
-                return f"user:{user}"
+        token = request.cookies.get(SESSION_COOKIE) or extract_key(request)
+        if token:
+            return "cred:" + hashlib.sha256(token.encode("utf-8")).hexdigest()[:32]
         return get_remote_address(request)
     return request.headers.get("X-User-Id") or get_remote_address(request)
+
+
+# Endpoints where a cheap IP-scoped limit is the actual defence: they are
+# reachable without credentials, and each one is a guessing surface (a
+# password, or a six-digit code).
+_AUTH_PATHS = ("/auth/login", "/auth/signup", "/auth/verify", "/auth/resend")
+
+
+async def _csrf_guard(request: Request, call_next):
+    """Reject cross-site state-changing requests that carry a session cookie.
+
+    SameSite=Lax already stops the browser sending the cookie on cross-site
+    POSTs; this is the belt to that suspenders, and it covers older browsers.
+    Requests authenticated by an API key are unaffected — headers cannot be set
+    by a cross-site form, which is what makes CSRF a cookie-only problem.
+    """
+    if request.method in ("GET", "HEAD", "OPTIONS"):
+        return await call_next(request)
+    from graphrag.api.deps import SESSION_COOKIE
+
+    if request.cookies.get(SESSION_COOKIE):
+        origin = request.headers.get("Origin")
+        if origin:
+            allowed = request.app.state.container.settings.api.cors_origins
+            host = request.headers.get("Host", "")
+            same_host = origin.split("//")[-1] == host
+            if not same_host and origin not in allowed and "*" not in allowed:
+                return JSONResponse(
+                    status_code=403,
+                    content={"detail": "Cross-site request rejected"},
+                )
+    return await call_next(request)
 
 
 # Health/readiness/metrics poll every few seconds and would bury everything else.
@@ -188,6 +226,31 @@ async def _lifespan(app: FastAPI):
     elif container.settings.auth.enabled:
         log.warning("database_missing", hint="set GRAPHRAG_DATABASE_URL — accounts need it")
 
+    # Accounts + API keys. Both read from Postgres, so they are rebuilt here
+    # rather than in create_app, where the engine does not exist yet.
+    from graphrag.accounts import AccountService, PgKeyStore, build_email_sender
+
+    email_sender = build_email_sender(container.settings, container.secrets)
+    app.state.accounts = AccountService(
+        app.state.db, container.settings, email_sender, container.redis
+    )
+    app.state.key_store = PgKeyStore(app.state.db, container.redis)
+
+    # Bootstrap the first admin from configuration: with no admin account and
+    # no admin key, the admin surface is locked (fail-closed), and there would
+    # be no way in.
+    if container.secrets.admin_email and app.state.db is not None:
+        try:
+            promoted = await app.state.accounts.promote_admin(container.secrets.admin_email)
+            if not promoted:
+                log.info(
+                    "admin_bootstrap_pending",
+                    email=container.secrets.admin_email,
+                    hint="sign up with this address, then restart to claim admin",
+                )
+        except Exception as exc:
+            log.warning("admin_bootstrap_failed", error=str(exc))
+
     await _init_agent_memory(app, container)
 
     try:
@@ -249,18 +312,20 @@ def create_app(container: Container | None = None) -> FastAPI:
     app.state.container = container
     app.state.query_service = QueryService(container)
     app.state.job_store = JobStore(container.redis)
-    app.state.key_store = KeyStore(container.redis)
     app.state.users = {container.settings.tenancy.default_user}
+    # Real instances are built in the lifespan, once the database engine exists.
+    app.state.accounts = None
+    app.state.key_store = None
     if container.settings.auth.enabled:
-        log.info("auth_enabled", note="API key required (Authorization: Bearer)")
-        if not container.secrets.admin_api_key:
+        log.info("auth_enabled", note="session cookie or API key required")
+        if not (container.secrets.admin_api_key or container.secrets.admin_email):
             log.warning(
-                "admin_key_missing",
-                note="auth is on but GRAPHRAG_ADMIN_KEY is unset — "
-                     "user creation is locked until it is configured",
+                "admin_access_locked",
+                note="auth is on but neither GRAPHRAG_ADMIN_KEY nor "
+                     "GRAPHRAG_ADMIN_EMAIL is set — the admin panel is unreachable",
             )
 
-    # Rate limiting (per verified user / IP). Redis-backed when available so
+    # Rate limiting (per credential / IP). Redis-backed when available so
     # limits hold across API replicas; in-memory otherwise.
     storage_uri = container.secrets.redis_url if container.redis is not None else "memory://"
     app.state.limiter = Limiter(
@@ -271,21 +336,26 @@ def create_app(container: Container | None = None) -> FastAPI:
     app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
     app.add_middleware(SlowAPIMiddleware)
     app.middleware("http")(_log_requests)
+    app.middleware("http")(_csrf_guard)
 
     app.add_middleware(
         CORSMiddleware,
         allow_origins=container.settings.api.cors_origins,
         allow_methods=container.settings.api.cors_methods,
         allow_headers=container.settings.api.cors_headers,
+        # Session cookies only travel cross-origin with credentials allowed —
+        # this is what lets the Vite dev server talk to the API.
+        allow_credentials=True,
     )
 
     @app.get("/metrics", include_in_schema=False)
     def metrics() -> Response:
         return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
-    from graphrag.api.routers import health, ingest, query, search, users
+    from graphrag.api.routers import auth, health, ingest, query, search, users
 
     app.include_router(health.router)
+    app.include_router(auth.router)
     app.include_router(users.router)
     app.include_router(ingest.router)
     app.include_router(query.router)

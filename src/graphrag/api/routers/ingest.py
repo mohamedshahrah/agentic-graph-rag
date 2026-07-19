@@ -17,7 +17,7 @@ from pathlib import Path
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, UploadFile
 
-from graphrag.api.deps import get_container, get_current_user, get_job_store
+from graphrag.api.deps import AuthUser, get_container, get_current_user, get_job_store
 from graphrag.api.schemas import (
     DeleteResponse,
     FileList,
@@ -25,7 +25,7 @@ from graphrag.api.schemas import (
     IngestStatus,
     StoredFile,
 )
-from graphrag.container import Container, sanitize_user
+from graphrag.container import Container
 from graphrag.core.logging import get_logger
 from graphrag.jobs import JobStatus, JobStore
 from graphrag.pipelines import IngestPipeline
@@ -135,10 +135,10 @@ async def ingest_upload(
     file: UploadFile,
     container: Container = Depends(get_container),
     store: JobStore = Depends(get_job_store),
-    user: str | None = Depends(get_current_user),
+    user: AuthUser = Depends(get_current_user),
 ) -> IngestResponse:
     api = container.settings.api
-    user_key = sanitize_user(user or container.settings.tenancy.default_user)
+    user_key = user.tenant_id
 
     data = await file.read()
     if len(data) > api.max_upload_mb * 1024 * 1024:
@@ -161,15 +161,15 @@ async def ingest_upload(
     except OSError:
         _release_file_slot(container, user_key, file_id)  # don't strand the slot
         raise
-    return await _enqueue(request, background, container, store, str(dest), user)
+    return await _enqueue(request, background, container, store, str(dest), user_key)
 
 
 @router.get("/ingest/files", response_model=FileList)
 def list_files(
     container: Container = Depends(get_container),
-    user: str | None = Depends(get_current_user),
+    user: AuthUser = Depends(get_current_user),
 ) -> FileList:
-    user_key = sanitize_user(user or container.settings.tenancy.default_user)
+    user_key = user.tenant_id
     limit = container.settings.api.max_files_per_user
     r = container.redis
     if r is None:
@@ -186,10 +186,10 @@ def list_files(
 def delete_file(
     file_id: str,
     container: Container = Depends(get_container),
-    user: str | None = Depends(get_current_user),
+    user: AuthUser = Depends(get_current_user),
 ) -> DeleteResponse:
     """Remove an uploaded file, everything it put in the graph, and its slot."""
-    user_key = sanitize_user(user or container.settings.tenancy.default_user)
+    user_key = user.tenant_id
     r = container.redis
     if r is None:
         raise HTTPException(status_code=503, detail="File tracking needs Redis")
@@ -242,13 +242,15 @@ async def ingest_path(
     path: str,
     container: Container = Depends(get_container),
     store: JobStore = Depends(get_job_store),
-    user: str | None = Depends(get_current_user),
+    user: AuthUser = Depends(get_current_user),
 ) -> IngestResponse:
     """Ingest a server-side path under `data/`, or an http(s) URL."""
     if path.startswith(("http://", "https://")):
         max_bytes = container.settings.api.max_upload_mb * 1024 * 1024
         dest = _fetch_url(path, max_bytes)
-        return await _enqueue(request, background, container, store, str(dest), user)
+        return await _enqueue(
+            request, background, container, store, str(dest), user.tenant_id
+        )
 
     requested = Path(path)
     try:
@@ -262,7 +264,9 @@ async def ingest_path(
         ) from None
     if not resolved.exists():
         raise HTTPException(status_code=404, detail=f"Path not found: {path}")
-    return await _enqueue(request, background, container, store, str(resolved), user)
+    return await _enqueue(
+        request, background, container, store, str(resolved), user.tenant_id
+    )
 
 
 @router.get("/ingest/{job_id}", response_model=IngestStatus)

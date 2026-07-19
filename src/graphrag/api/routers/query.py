@@ -8,7 +8,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends
 from sse_starlette.sse import EventSourceResponse
 
-from graphrag.api.deps import get_container, get_current_user, get_query_service
+from graphrag.api.deps import AuthUser, get_container, get_current_user, get_query_service
 from graphrag.api.schemas import (
     CompareRequest,
     QueryRequest,
@@ -46,21 +46,22 @@ async def query(
     req: QueryRequest,
     service: QueryService = Depends(get_query_service),
     container: Container = Depends(get_container),
-    user: str | None = Depends(get_current_user),
+    user: AuthUser = Depends(get_current_user),
 ):
     stream = req.stream if req.stream is not None else container.settings.api.stream
     model = _chat_model(container, req.model)
     if stream:
         return EventSourceResponse(
             sse_answer(
-                service, req.question, req.style, req.thread_id, user,
+                service, req.question, req.style, req.thread_id, user.tenant_id,
                 redis_client=container.redis, model=model,
             )
         )
     # Async, not sync-in-threadpool: the API's checkpointer is the async saver,
     # which refuses sync `.invoke()`.
     result = await service.aanswer(
-        req.question, style=req.style, thread_id=req.thread_id, user_id=user, model=model
+        req.question, style=req.style, thread_id=req.thread_id,
+        user_id=user.tenant_id, model=model,
     )
     return _shape(result)
 
@@ -70,13 +71,13 @@ async def compare(
     req: CompareRequest,
     service: QueryService = Depends(get_query_service),
     container: Container = Depends(get_container),
-    user: str | None = Depends(get_current_user),
+    user: AuthUser = Depends(get_current_user),
 ):
     subjects = ", ".join(req.subjects)
     aspects = ("along these aspects: " + ", ".join(req.aspects)) if req.aspects else ""
     question = f"Compare {subjects} {aspects}. Present the comparison as a table."
     result = await service.aanswer(
-        question, style=req.style, thread_id=req.thread_id, user_id=user,
+        question, style=req.style, thread_id=req.thread_id, user_id=user.tenant_id,
         model=_chat_model(container, req.model),
     )
     return _shape(result)

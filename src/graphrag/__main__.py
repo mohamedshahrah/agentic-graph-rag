@@ -60,26 +60,129 @@ def search(
         typer.echo(f"   {chunk.text[:160]}...")
 
 
+def _accounts(container):
+    """Build the account services against Postgres, for CLI use."""
+    from graphrag.accounts import AccountService, PgKeyStore, build_email_sender
+    from graphrag.db import build_engine, build_sessionmaker
+
+    engine = build_engine(container.secrets.database_url)
+    factory = build_sessionmaker(engine)
+    sender = build_email_sender(container.settings, container.secrets)
+    return (
+        engine,
+        AccountService(factory, container.settings, sender, container.redis),
+        PgKeyStore(factory, container.redis),
+    )
+
+
+def _run(coro):
+    """Run one async call and dispose the engine afterwards.
+
+    A selector loop, because psycopg's async mode refuses the ProactorEventLoop
+    that Windows uses by default.
+    """
+    import asyncio
+    import selectors
+    import sys
+
+    if sys.platform == "win32":
+        loop = asyncio.SelectorEventLoop(selectors.SelectSelector())
+        asyncio.set_event_loop(loop)
+        try:
+            return loop.run_until_complete(coro)
+        finally:
+            loop.close()
+    return asyncio.run(coro)
+
+
 @app.command()
-def apikey(user: str) -> None:
-    """Mint an API key for a user (prints it once)."""
-    from graphrag.auth import KeyStore
+def apikey(email: str, label: str = typer.Option("", help="a note to identify this key")) -> None:
+    """Mint an API key for an account (prints it once)."""
+    from sqlalchemy import func, select
+
+    from graphrag.accounts import normalize_email
     from graphrag.container import Container
+    from graphrag.db.models import User
 
     container = Container()
-    key = KeyStore(container.redis).create_key(user)
-    container.tenant(user)  # ensure the user's namespace exists
+    engine, accounts, keys = _accounts(container)
+
+    async def _mint() -> str | None:
+        from graphrag.db.engine import session_scope
+
+        async with session_scope(keys._factory) as s:
+            user = (
+                await s.execute(
+                    select(User).where(func.lower(User.email) == normalize_email(email))
+                )
+            ).scalar_one_or_none()
+            if user is None:
+                return None
+            user_id, tenant = str(user.id), user.tenant_id
+        key = await keys.create_key(user_id, label)
+        container.tenant(tenant)  # ensure the namespace exists
+        await engine.dispose()
+        return key
+
+    key = _run(_mint())
+    if key is None:
+        typer.echo(f"No account for {email}. Sign up first.")
+        raise typer.Exit(1)
     typer.echo(key)
 
 
 @app.command()
-def revoke(user: str) -> None:
-    """Revoke every API key a user holds (their data stays)."""
-    from graphrag.auth import KeyStore
+def revoke(email: str) -> None:
+    """Revoke every API key an account holds (their data stays)."""
+    from sqlalchemy import func, select
+
+    from graphrag.accounts import normalize_email
+    from graphrag.container import Container
+    from graphrag.db.models import User
+
+    container = Container()
+    engine, accounts, keys = _accounts(container)
+
+    async def _revoke() -> int | None:
+        from graphrag.db.engine import session_scope
+
+        async with session_scope(keys._factory) as s:
+            user = (
+                await s.execute(
+                    select(User).where(func.lower(User.email) == normalize_email(email))
+                )
+            ).scalar_one_or_none()
+            if user is None:
+                return None
+            user_id = str(user.id)
+        count = await keys.revoke_user(user_id)
+        await engine.dispose()
+        return count
+
+    count = _run(_revoke())
+    if count is None:
+        typer.echo(f"No account for {email}.")
+        raise typer.Exit(1)
+    typer.echo(f"Revoked {count} key(s) for '{email}'.")
+
+
+@app.command("promote-admin")
+def promote_admin(email: str) -> None:
+    """Grant an existing account the admin role (and activate it)."""
     from graphrag.container import Container
 
-    count = KeyStore(Container().redis).revoke_user(user)
-    typer.echo(f"Revoked {count} key(s) for '{user}'.")
+    container = Container()
+    engine, accounts, _keys = _accounts(container)
+
+    async def _promote() -> bool:
+        ok = await accounts.promote_admin(email)
+        await engine.dispose()
+        return ok
+
+    if not _run(_promote()):
+        typer.echo(f"No account for {email}. Sign up first, then run this again.")
+        raise typer.Exit(1)
+    typer.echo(f"{email} is now an admin.")
 
 
 @app.command()

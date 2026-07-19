@@ -185,11 +185,32 @@ class IngestionCfg(BaseModel):
     communities: CommunityCfg = Field(default_factory=CommunityCfg)
 
 
+class EmailCfg(BaseModel):
+    # console -> codes are logged, not sent (dev). resend | brevo need the
+    # matching API key in the environment, or they fall back to console.
+    provider: str = "console"
+    from_addr: str = ""  # defaults to GRAPHRAG_EMAIL_FROM
+
+
 class AuthCfg(BaseModel):
-    # When enabled, requests must carry a valid API key (Authorization: Bearer
-    # <key>, or X-API-Key). The verified key determines the user — the
-    # X-User-Id header is then ignored. Disabled by default for local dev.
+    # When enabled, requests must carry a session cookie or a valid API key
+    # (Authorization: Bearer <key>, or X-API-Key). The verified identity
+    # determines the user — the X-User-Id header is then ignored. Disabled by
+    # default for local dev.
     enabled: bool = False
+    # Anyone may register (after verifying their address). False -> only an
+    # admin can create accounts.
+    open_registration: bool = True
+    session_ttl_days: int = 30
+    # Verification codes are short-lived and attempt-capped: six digits is only
+    # a million possibilities, so unlimited guesses would be trivially brute
+    # forced.
+    otp_ttl_minutes: int = 15
+    otp_max_attempts: int = 5
+    # Set false only when serving over plain HTTP (the cookie won't be sent
+    # back over http:// while this is true).
+    cookie_secure: bool = True
+    email: EmailCfg = Field(default_factory=EmailCfg)
 
 
 class TenancyCfg(BaseModel):

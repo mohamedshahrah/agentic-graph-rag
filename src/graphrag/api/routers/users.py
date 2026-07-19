@@ -1,14 +1,18 @@
-"""User management. A "user" is an isolated namespace; creating one prepares its
-indexes and (when auth is enabled) mints an API key. The registry lives in Redis
-(falling back to in-memory). All of it is admin-gated when auth is on."""
+"""Legacy user management.
+
+Accounts are created by signing up (`/auth/signup`); these endpoints remain for
+the admin-key workflow and for scripts written against the older API. `/usage`
+is superseded by the admin dashboard's aggregates but still reports the raw
+Redis token counters.
+"""
 
 from __future__ import annotations
 
 import contextlib
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 
-from graphrag.api.deps import get_container, get_key_store, require_admin
+from graphrag.api.deps import AuthUser, get_container, get_key_store, require_admin_user
 from graphrag.api.schemas import (
     KeysRevoked,
     UsageReport,
@@ -16,7 +20,6 @@ from graphrag.api.schemas import (
     UserCreated,
     UsersList,
 )
-from graphrag.auth import KeyStore
 from graphrag.container import Container, sanitize_user
 
 router = APIRouter(tags=["users"])
@@ -40,45 +43,55 @@ def _members(request: Request, container: Container) -> list[str]:
 
 
 @router.post("/users", response_model=UserCreated)
-def create_user(
+async def create_user(
     payload: UserCreate,
     request: Request,
-    _: None = Depends(require_admin),
+    _: AuthUser | None = Depends(require_admin_user),
     container: Container = Depends(get_container),
-    key_store: KeyStore = Depends(get_key_store),
 ) -> UserCreated:
+    """Prepare a bare namespace (indexes only), with no login attached.
+
+    Real accounts come from /auth/signup — they have an email, a password and a
+    verified address. This exists for scripted single-tenant setups; with auth
+    enabled it cannot mint a key, because keys now belong to an account row.
+    """
     user = sanitize_user(payload.user_id)
     _register(request, container, user)
     container.tenant(user)  # prepare the user's namespace (indexes)
 
-    api_key = key_store.create_key(user) if container.settings.auth.enabled else None
-    return UserCreated(user_id=user, api_key=api_key)
+    if container.settings.auth.enabled:
+        raise HTTPException(
+            status_code=400,
+            detail="With auth enabled, create accounts via /auth/signup "
+                   "(keys are issued from /auth/keys).",
+        )
+    return UserCreated(user_id=user, api_key=None)
 
 
 @router.get("/users", response_model=UsersList)
-def list_users(
+async def list_users(
     request: Request,
-    _: None = Depends(require_admin),
+    _: AuthUser | None = Depends(require_admin_user),
     container: Container = Depends(get_container),
 ) -> UsersList:
     return UsersList(users=_members(request, container))
 
 
 @router.delete("/users/{user_id}/keys", response_model=KeysRevoked)
-def revoke_keys(
+async def revoke_keys(
     user_id: str,
-    _: None = Depends(require_admin),
-    key_store: KeyStore = Depends(get_key_store),
+    _: AuthUser | None = Depends(require_admin_user),
+    key_store=Depends(get_key_store),
 ) -> KeysRevoked:
     """Revoke every API key a user holds (their data stays). The way to cut off
-    a leaked key: revoke, then mint a fresh one via POST /users."""
-    user = sanitize_user(user_id)
-    return KeysRevoked(user_id=user, revoked=key_store.revoke_user(user))
+    a leaked key: revoke, then mint a fresh one via /auth/keys."""
+    revoked = await key_store.revoke_user(user_id)
+    return KeysRevoked(user_id=user_id, revoked=revoked)
 
 
 @router.get("/usage", response_model=UsageReport)
-def usage(
-    _: None = Depends(require_admin),
+async def usage(
+    _: AuthUser | None = Depends(require_admin_user),
     container: Container = Depends(get_container),
 ) -> UsageReport:
     """Per-user streamed-token counts (approximate — one SSE chunk ≈ one token)."""

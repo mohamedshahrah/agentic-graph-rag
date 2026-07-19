@@ -93,6 +93,68 @@ class DeleteResponse(BaseModel):
     chunks_removed: int = 0
 
 
+class SignupRequest(BaseModel):
+    email: str = Field(..., min_length=3, max_length=320)
+    password: str = Field(..., min_length=1, max_length=128)
+
+
+class VerifyRequest(BaseModel):
+    email: str = Field(..., min_length=3, max_length=320)
+    code: str = Field(..., min_length=4, max_length=12)
+
+
+class EmailRequest(BaseModel):
+    email: str = Field(..., min_length=3, max_length=320)
+
+
+class LoginRequest(BaseModel):
+    email: str = Field(..., min_length=3, max_length=320)
+    password: str = Field(..., min_length=1, max_length=128)
+
+
+class Acknowledged(BaseModel):
+    ok: bool = True
+    message: str = ""
+
+
+class ModelOption(BaseModel):
+    model: str
+    label: str
+    provider: str
+
+
+class Me(BaseModel):
+    """Everything the UI needs to render a signed-in session."""
+
+    user_id: str
+    email: str = ""
+    role: str = "user"
+    tenant_id: str = ""
+    authenticated: bool = True
+    models: list[ModelOption] = []
+    default_model: str = ""
+
+
+class APIKeyInfo(BaseModel):
+    id: int
+    label: str = ""
+    created_at: str = ""
+    last_used_at: str | None = None
+
+
+class APIKeyList(BaseModel):
+    keys: list[APIKeyInfo] = []
+
+
+class APIKeyCreate(BaseModel):
+    label: str = Field("", max_length=64)
+
+
+class APIKeyCreated(BaseModel):
+    id: int
+    api_key: str  # shown once
+
+
 class UserCreate(BaseModel):
     user_id: str = Field(..., min_length=1, max_length=48)
 
