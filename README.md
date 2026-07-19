@@ -79,15 +79,16 @@ For the full picture, see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
 ### Option A — one command (Docker)
 
-Brings up Neo4j, Redis, the API, an **ingest worker**, the web UI, and a **TLS
-reverse proxy** together. Per-container RAM/CPU caps are set in `.env`
-(`*_MEM_LIMIT` / `*_CPU_LIMIT`) — tune them to your machine.
+Brings up Neo4j, **Postgres**, Redis, the API, the web UI, and a **TLS reverse
+proxy** together. Per-container RAM/CPU caps are set in `.env` (`*_MEM_LIMIT` /
+`*_CPU_LIMIT`); the defaults target a 2 vCPU / 8 GB VPS.
 
 ```bash
 git clone <your-repo-url> agentic-graph-rag && cd agentic-graph-rag
-cp .env.example .env          # then edit .env: set NEO4J password (+ API keys if using the api profile)
-make setup PROFILE=api        # or: PROFILE=local  (fully local, no keys)
+cp .env.example .env          # set the Neo4j + Postgres passwords and your API keys
+make setup PROFILE=production # or: PROFILE=local  (fully local, no keys, no accounts)
 make up
+docker compose exec api alembic upgrade head   # create the account tables
 ```
 
 The frontend only starts once the API reports healthy (compose waits on a
@@ -97,11 +98,30 @@ healthcheck), so when it's up, the whole stack is up. Then open:
 - **API docs (Swagger, test any endpoint here)** — http://localhost:8000/docs
 - **Neo4j browser** — http://localhost:7474
 
-**The whole workflow lives in the browser:** the web UI has a live status bar
-(API / Neo4j / Redis), a drag-and-drop **document upload** with per-file ingest
-progress, and a streaming chat that shows the **sources** behind every answer.
-Add documents, ask questions, and watch the system — end to end, no terminal
-needed after `make up`.
+Sign up with your email, enter the 6-digit code, and you're in. Without a
+`RESEND_API_KEY` / `BREVO_API_KEY` the code is written to the server log instead
+of sent — fine for a first run:
+
+```bash
+docker compose logs api | grep "code is"
+```
+
+To claim the admin panel, set `GRAPHRAG_ADMIN_EMAIL` to the address you signed
+up with and restart, or promote it directly:
+
+```bash
+docker compose exec api graphrag promote-admin you@example.com
+```
+
+**The whole workflow lives in the browser:** drag-and-drop document upload with
+per-file ingest progress, streaming chat that shows the **sources** behind every
+answer, an account page with your usage against your limits, and — for admins —
+users, limits, usage charts and per-tenant graph inspection.
+
+> **Profiles decide whether authentication is on.** `local` and `api` are
+> development profiles: auth is **off**, and any caller can act as any user via
+> the `X-User-Id` header. Use `production` for anything reachable from a
+> network. The API logs a warning at startup when auth is disabled.
 
 Ingest the sample corpus and ask a question:
 
@@ -135,13 +155,14 @@ verify rather than trust the capability list. See
 
 ### Option B — just the API (no Docker)
 
-You need a Neo4j and a Redis reachable from your machine (local installs, cloud,
-or `docker compose up neo4j redis`).
+You need a Neo4j and a Redis reachable from your machine, plus Postgres if you
+want accounts (`docker compose up neo4j redis postgres`).
 
 ```bash
-pip install -e ".[dev,extras]"   # extras = Voyage/Cohere providers the api profile uses
-cp .env.example .env          # point GRAPHRAG_NEO4J_* / GRAPHRAG_REDIS_URL at your services
-make serve PROFILE=api        # uvicorn on :8000, docs at /docs
+pip install -e ".[dev,extras]"   # extras = Cohere/Voyage providers the cloud profiles use
+cp .env.example .env          # point GRAPHRAG_NEO4J_* / _REDIS_URL / _DATABASE_URL at your services
+alembic upgrade head          # only needed for the production profile
+make serve PROFILE=local      # uvicorn on :8000, docs at /docs
 graphrag ingest data/sample.md
 graphrag query "How are Acme Robotics and Riverside University connected?"
 ```
@@ -150,16 +171,33 @@ graphrag query "How are Acme Robotics and Riverside University connected?"
 
 ## The API
 
-Every request is scoped to a **user** via the `X-User-Id` header (the UI has a
-user picker; the CLI takes `--user`). Each user has a fully isolated knowledge
-base, while the heavy models are loaded once and shared across everyone — so
-adding users costs almost no extra memory. See
+With the `production` profile every request carries a **session cookie** (the
+web UI) or an **API key** (`Authorization: Bearer grk_…`, for scripts). Each
+account gets a fully isolated knowledge base — its own Neo4j corpus and its own
+DuckDB vector file — while the heavy models are loaded once and shared across
+everyone, so adding users costs almost no extra memory.
+
+Development profiles have auth off and fall back to the `X-User-Id` header. See
 [`docs/CONFIGURATION.md`](docs/CONFIGURATION.md) → Multi-user.
+
+```bash
+# Sign up, verify, and use the session — or mint a key and skip the cookie:
+graphrag apikey you@example.com
+curl -H "Authorization: Bearer grk_…" -X POST localhost:8000/query \
+     -H 'Content-Type: application/json' -d '{"question":"...","stream":false}'
+```
 
 | Method | Path | What it does |
 | --- | --- | --- |
-| `POST` | `/users` · `GET` `/users` | Create / list users (isolated namespaces). Admin-gated when auth is on. |
-| `DELETE` | `/users/{id}/keys` | Revoke every API key a user holds (data stays). |
+| `POST` | `/auth/signup` · `/auth/verify` · `/auth/login` · `/auth/logout` | Create an account, confirm the emailed code, sign in and out. |
+| `GET`  | `/auth/me` · `/auth/limits` | Who am I; my allowances and what I've used. |
+| `GET`/`POST`/`DELETE` | `/auth/keys` | Personal API keys (shown once). |
+| `GET`/`POST`/`PATCH`/`DELETE` | `/threads` · `/threads/{id}` · `/threads/{id}/messages` | Conversations and their transcripts. |
+| `GET`  | `/admin/users` · `/admin/users/{id}` | List, search and inspect accounts. |
+| `PATCH`/`DELETE` | `/admin/users/{id}` | Suspend, change role, or purge everything they own. |
+| `GET`/`PUT` | `/admin/limits` · `/admin/users/{id}/limits` · `/admin/limits/bulk` | Limits: global defaults, per user, or applied to everyone. |
+| `GET`  | `/admin/usage` · `/admin/system` · `/admin/audit` | Usage over time, service status, admin action log. |
+| `GET`  | `/admin/users/{id}/graph` · `/graph/sample` | A tenant's knowledge-graph stats and a slice to visualize. |
 | `POST` | `/query` | Ask a question. Streams the answer (SSE) by default; returns sources used. |
 | `POST` | `/compare` | Side-by-side comparison of several subjects. |
 | `POST` | `/search` | Raw hybrid retrieval, no LLM — see exactly what the retriever returns. |
@@ -179,12 +217,16 @@ by FastAPI, so "write and test a request" needs no extra tool.
 ## Configuration in one breath
 
 Settings are layered: `configs/default.yaml` → `configs/<profile>.yaml` → `.env`.
-Two ready-made profiles ship with the repo:
+Three ready-made profiles ship with the repo:
 
+- **`production.yaml`** — the deployment: accounts and limits **on**, Gemini for
+  chat (DeepSeek and Qwen selectable), Cohere `embed-v4.0` + `rerank-v4.0-fast`,
+  DuckDB vectors, Postgres for accounts and agent memory. No torch anywhere.
 - **`local.yaml`** — everything on your host's Ollama, no keys and no model
   weights downloaded: gemma4 for chat/rerank/extraction, gemma3 for OCR, `bge-m3`
-  for embeddings. (`local-gemma.yaml` swaps in a larger Gemma 4 for chat.)
+  for embeddings. Auth off. (`local-gemma.yaml` swaps in a larger Gemma 4.)
 - **`api.yaml`** — Claude (`claude-opus-4-8`), Voyage embeddings, Gemini OCR.
+  Auth off.
 
 Every model role is its own key — `llm`, `ingestion.llm`, `ocr.vision_llm`,
 `retrieval.rerank`, `embeddings` — so you can run a different model per role, or
@@ -358,22 +400,34 @@ src/graphrag/
 │
 ├── ─────────────── PLUMBING ────────────────────────────────────────────
 │
-├── llm/factory.py  One function ──▶ a chat model for any provider
-├── storage/        GraphStore + VectorStore interfaces ──▶ Neo4j | local adapters
-│   └── vector/       neo4j_vector (native index) · local_store (numpy files)
+├── llm/            factory.py (a chat model for any provider) · registry.py
+│                     (which models a request may ask for)
+├── storage/        GraphStore + VectorStore interfaces ──▶ swappable adapters
+│   └── vector/       duckdb_store (one DB file per user) · neo4j_vector ·
+│                     local_store (numpy files)
 ├── pipelines/      Wires the above into `ingest` and `query` flows
+│
+├── ─────────────── ACCOUNTS & CONTROL ─────────────────────────────────────
+│
+├── db/             SQLAlchemy models + engine — the Postgres system of record
+├── accounts/       Signup · email codes · sessions · API keys · purge
+├── limits/         Per-user quotas: what they are, and enforcing them
+├── usage/          Recording what was used, for meters and admin charts
+│
 ├── jobs.py         Ingest job status, persisted in Redis
-├── worker.py       Arq worker — runs ingest off the API process
-├── auth.py         API keys (SHA-256 hashed) — the key identifies the user
+├── worker.py       Arq worker — optional; ingest runs in-process by default
+├── auth.py         The API-key format (SHA-256 hashed, shown once)
 ├── __main__.py     The `graphrag` CLI
 ├── api/            FastAPI: routers · SSE streaming · deps · /metrics
 └── container.py    Composition root: reads config, builds everything, once
 
-frontend/           React + Vite chat UI (threads, upload, sources), nginx
-configs/            The YAML profiles — default · local · api · local-gemma
+migrations/         Alembic — the Postgres schema, versioned
+frontend/           React + Vite: chat, account, admin dashboard; nginx
+configs/            The YAML profiles — default · production · local · api
 docker/             API image + Caddy reverse-proxy config
 scripts/eval.py     Score retrieval + answers against data/eval/qa.yaml (make eval)
 tests/unit/         Fast, no services needed. Start here to learn the codebase.
+tests/integration/  Against real Postgres — accounts, limits, admin (see below)
 ```
 
 ### How a request moves through it
@@ -381,20 +435,23 @@ tests/unit/         Fast, no services needed. Start here to learn the codebase.
 **Ingesting** `report.pdf`:
 
 ```
-api/routers/ingest.py   accepts the upload, queues a job
-        │
-worker.py               picks it up (so a big PDF never blocks the API)
-        │
+api/routers/ingest.py   checks the caller's quota, stores the file, queues a job
+        │                 (in-process by default — the DuckDB vector store needs
+        │                  one owner per file; GRAPHRAG_USE_WORKER hands it to
+        │                  worker.py instead)
 pipelines/ingest.py     drives the rest:
   loaders/pdf.py          PDF ──▶ text   (ocr/ if a page is a scan)
   chunking/               text ──▶ chunks
-  embeddings/             chunks ──▶ vectors ──▶ storage/vector  (Neo4j index)
+  embeddings/             chunks ──▶ vectors ──▶ storage/vector  (the user's DuckDB file)
   extraction/             chunks ──▶ entities + relations ──▶ storage/graph
 ```
 
 **Answering** *"How are Acme and Riverside connected?"*:
 
 ```
+api/deps.py             resolves the caller: session cookie ──▶ API key ──▶ (dev header)
+limits/                 is this message within their quota? 429 if not
+        │
 api/routers/query.py    receives it, opens an SSE stream
         │
 pipelines/query.py      starts an agent session
@@ -427,9 +484,12 @@ config and builds the object graph once. Heavy things (models, drivers) are
 why adding users costs almost no memory — only the small per-tenant wrappers are
 duplicated.
 
-**Ingest and query are separate processes.** The worker does the slow work
-(OCR, embedding, extraction) so the API stays responsive, and you can cap their
-resources independently in `docker-compose.yml`.
+**Ingest runs off the request, not off the process.** The slow work (OCR,
+embedding, extraction) runs as a background task under a semaphore, so a large
+upload never blocks a chat stream and two uploads can't fight over the same two
+cores. It stays *in* the API process because each user's DuckDB vector file
+needs a single owner; set `GRAPHRAG_USE_WORKER=1` (with the Neo4j vector
+provider) to hand it to a separately capped worker container instead.
 
 **Reading it for the first time?** `core/types.py` (the vocabulary) ──▶
 `configs/default.yaml` (every knob, commented) ──▶ `container.py` (how it's
@@ -442,47 +502,60 @@ second with no Neo4j or Ollama, and each test documents one real failure mode.
 
 This is built to run as a controllable service, not just a demo. What's in place:
 
-- **Background ingest queue.** Uploads are queued to a separate **Arq worker**
-  container (Redis-backed), so large ingests never block the API and the heavy
-  work (embeddings + graph extraction) runs where you can cap its resources. Job
-  status is persisted in Redis and polled by id. If no worker/Redis is present,
-  it falls back to in-process tasks so single-container dev still works.
-- **Durable agent memory.** Conversation memory uses a Redis-backed LangGraph
-  checkpointer, so multi-turn context survives restarts and is shared across API
-  replicas. The API uses the async saver (its streaming needs it), the CLI the
-  sync one — same keyspace, so both see the same threads. A Redis that's actually
-  unreachable (not just a missing package) degrades to in-process memory instead
-  of failing every query.
+- **Real accounts.** Email + password, with a 6-digit code proving the address
+  exists before the account activates. Sessions are server-side: the cookie
+  carries an opaque token, the database stores only its hash, and it's httpOnly
+  + SameSite=Lax with the Secure flag following the request scheme. Suspending
+  an account kills its sessions *and* its API keys on the next request — the
+  reason sessions aren't stateless tokens. Signup, resend and login answer
+  identically for known and unknown addresses so they can't be used to discover
+  who has an account.
+- **Enforced per-user limits.** Messages per minute and per day, token budgets
+  per day and month, document count, per-file and total storage, indexed chunks,
+  conversations. A refused request never reaches the model, and the 429 names
+  the limit, the ceiling and the reset so the UI can say "12 of 12 today, resets
+  in 4 hours". Rate windows live in Redis (fast, and fail *open* so a cache blip
+  doesn't lock everyone out); the caps guarding durable resources read Postgres,
+  so a deleted file returns its quota automatically.
+- **Admin dashboard.** Users with search and status filters, per-user detail
+  with usage and knowledge-graph stats, limits edited globally / per user / in
+  bulk, usage charts, model availability, system status, and a full purge that
+  clears a user from Postgres, Neo4j, DuckDB and disk. Every mutation is
+  audited. Gated by an admin role, with `X-Admin-Key` as break-glass for
+  bootstrap; **fails closed** when neither is configured.
+- **Durable agent memory.** Conversation memory uses a LangGraph checkpointer in
+  Postgres (Redis also supported, with redis-stack), so multi-turn context
+  survives restarts. The API uses the async saver (its streaming needs it), the
+  CLI the sync one — same keyspace, so both see the same threads. If the
+  configured backend is unusable the API tries the other one before settling for
+  in-process memory, rather than silently losing conversations.
+- **Per-user isolation.** Each account gets its own Neo4j corpus *and* its own
+  DuckDB vector file, so one user's data is a separate artifact that can be
+  backed up, inspected or deleted on its own. Thread and file ids are checked
+  against the owner on every access, and a resource you don't own returns 404,
+  not 403 — ids can't be probed.
 - **Resource controls.** Every container has RAM/CPU caps (`.env`:
-  `API_MEM_LIMIT`, `WORKER_MEM_LIMIT`, `NEO4J_MEM_LIMIT`, `NEO4J_HEAP`, …), plus
-  CPU-thread caps (`OMP_NUM_THREADS`) and worker concurrency
-  (`GRAPHRAG_WORKER_CONCURRENCY`) so local models can't starve the host.
-- **Limits.** Per-user file cap (**10 files**, `api.max_files_per_user`), upload
-  size cap (`api.max_upload_mb`), and per-user **rate limiting** (`api.rate_limit`;
-  keyed by the *verified* user when auth is on, IP otherwise — never a spoofable
-  header, and Redis-backed so limits hold across replicas). CORS is restricted to
-  configured origins/methods/headers, and the API warns on a default Neo4j
-  password. The file cap counts what you currently store, not what you have ever
-  uploaded — `DELETE /ingest/files/{id}` frees a slot. Raising `max_upload_mb`
-  also needs `MAX_UPLOAD_MB` in `.env` raised (nginx rejects oversized bodies
-  before the API sees them, and its own default is 1 MB).
+  `API_MEM_LIMIT`, `NEO4J_MEM_LIMIT`, `NEO4J_HEAP`, `POSTGRES_MEM_LIMIT`, …),
+  defaulting to a set that fits 2 vCPU / 8 GB with headroom, plus CPU-thread caps
+  (`OMP_NUM_THREADS`) so local models can't starve the host.
 - **Confined server-side ingest.** `POST /ingest` with a path is fenced to
   `data/` (an attempt to reach `.env` or any other server file is a 400), and it
   also accepts an http(s) URL, fetched with a size cap. Uploads go through
-  `/ingest/upload` regardless.
-- **API-key authentication.** Set `auth.enabled: true` and requests must carry a
-  valid key (`Authorization: Bearer <key>`); the verified key determines the user,
-  so tenant identity is trustworthy (not a spoofable header). Keys are stored only
-  as SHA-256 hashes. User management **fails closed**: with auth on and no
-  `GRAPHRAG_ADMIN_KEY` set, `POST /users` is *locked*, not open — otherwise anyone
-  could mint themselves a key. Mint one with `graphrag apikey <user>` or (admin)
-  `POST /users`; revoke a leaked one with `graphrag revoke <user>` or
-  `DELETE /users/{id}/keys`. Off by default for local dev.
+  `/ingest/upload` regardless. Raising `max_upload_mb` also needs `MAX_UPLOAD_MB`
+  in `.env` raised — nginx rejects oversized bodies before the API sees them.
+- **Prompt-injection hardening.** Retrieved documents are attacker-controlled, so
+  everything a tool returns is sanitized (control characters, chat-template
+  special tokens) and wrapped in `<untrusted_data>` markers the system prompt
+  defines as evidence, never instructions. A chunk can't forge the closing
+  marker to escape its envelope. Tool output is capped, and nothing
+  user-supplied reaches a prompt except the question: the answer style is
+  enum-clamped, the model is validated against an allowlist, and the thread id
+  is ownership-checked.
 - **Observability.** Prometheus metrics at `/metrics` (request counts + latency
-  histograms, labeled by route template so cardinality stays bounded), and
-  approximate per-user token usage at `/usage`. A `make eval` target scores
-  retrieval and answers against a golden set (`data/eval/qa.yaml`) so retrieval
-  changes are measured, not guessed.
+  histograms, labeled by route template so cardinality stays bounded), durable
+  usage events in Postgres behind the admin charts, and structured request logs.
+  A `make eval` target scores retrieval and answers against a golden set
+  (`data/eval/qa.yaml`) so retrieval changes are measured, not guessed.
 - **TLS + reverse proxy.** A **Caddy** proxy is the public entrypoint (80/443):
   it terminates TLS, routes `/api/*` → API and everything else → the UI (and
   streams SSE). Behind it the UI and API share one origin, so CORS isn't needed.
@@ -502,12 +575,11 @@ For a public domain: point its DNS A record at the host, set `SITE_ADDRESS` and
 cert on :443 and redirects HTTP→HTTPS. For a real deployment, also remove the
 host `ports` from the `api`/`frontend` services so only the proxy is reachable.
 
-Still on the roadmap before untrusted-internet exposure: per-tenant vector
-isolation at scale (Enterprise DB-per-user), backups, and distributed tracing.
-Metrics are now exported at `/metrics`; the `local` vector provider (exact numpy
-search, no service) is a first step toward the quantized ANN backends —
-TurboQuant and friends — sketched in
-[`docs/OPTIMIZATION-NOTES.md`](docs/OPTIMIZATION-NOTES.md).
+Still on the roadmap: backups and restore drills for Postgres + the per-user
+DuckDB files, distributed tracing, and the quantized ANN backends sketched in
+[`docs/OPTIMIZATION-NOTES.md`](docs/OPTIMIZATION-NOTES.md) — the exact cosine
+scan DuckDB uses is honest and fast at the per-user chunk ceiling, but it is a
+scan.
 
 ## Development
 
@@ -517,6 +589,23 @@ make test        # unit tests (fast, no services)
 make eval        # score retrieval + answers vs the golden set (needs the stack up)
 make lint        # ruff + mypy
 make fmt         # auto-format
+```
+
+Integration tests need a real Postgres. They create and drop the schema
+themselves, so they refuse any database whose name doesn't look disposable:
+
+```bash
+docker compose up -d postgres
+docker compose exec postgres psql -U graphrag -d graphrag -c "CREATE DATABASE graphrag_test OWNER graphrag;"
+GRAPHRAG_TEST_DATABASE_URL=postgresql://graphrag:change-me@localhost:5432/graphrag_test \
+  pytest -m integration -q
+```
+
+The frontend is a separate build:
+
+```bash
+cd frontend && npm install && npm run dev   # Vite on :5173, proxying /api to :8000
+npm run build                               # tsc + production bundle
 ```
 
 Design decisions and the reasoning behind them live in

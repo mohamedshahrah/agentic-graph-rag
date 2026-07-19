@@ -19,10 +19,109 @@ jobs:
         run: pip install -e ".[dev]"
 
       - name: Lint
-        run: ruff check src tests
+        run: ruff check src tests migrations
 
       - name: Type check
         run: mypy src || true   # advisory until the codebase is fully typed
 
       - name: Unit tests
         run: pytest -m "not integration" -q
+
+  frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install
+        working-directory: frontend
+        run: npm ci
+
+      # `npm run build` runs tsc first, so this is the type check too.
+      - name: Build
+        working-directory: frontend
+        run: npm run build
+
+  integration:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: graphrag
+          POSTGRES_PASSWORD: graphrag
+          POSTGRES_DB: graphrag_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U graphrag"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install
+        run: pip install -e ".[dev,extras]"
+
+      # These fixtures create and drop the schema themselves, so no migration
+      # step — and the database name must look disposable or the suite refuses
+      # to run against it.
+      - name: Integration tests
+        env:
+          GRAPHRAG_TEST_DATABASE_URL: postgresql://graphrag:graphrag@localhost:5432/graphrag_test
+          GRAPHRAG_REDIS_URL: redis://localhost:6379/0
+        run: pytest -m integration -q
+
+  migrations:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: graphrag
+          POSTGRES_PASSWORD: graphrag
+          POSTGRES_DB: graphrag_migrations_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U graphrag"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install
+        run: pip install -e ".[dev]"
+
+      - name: Apply migrations
+        env:
+          GRAPHRAG_DATABASE_URL: postgresql://graphrag:graphrag@localhost:5432/graphrag_migrations_test
+        run: alembic upgrade head
+
+      # Fails if the models and the migrations have drifted apart — the kind of
+      # mismatch that otherwise surfaces as a missing column in production.
+      - name: Check for schema drift
+        env:
+          GRAPHRAG_DATABASE_URL: postgresql://graphrag:graphrag@localhost:5432/graphrag_migrations_test
+        run: alembic check
+
+      - name: Check the downgrade path
+        env:
+          GRAPHRAG_DATABASE_URL: postgresql://graphrag:graphrag@localhost:5432/graphrag_migrations_test
+        run: alembic downgrade base

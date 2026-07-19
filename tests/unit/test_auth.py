@@ -1,30 +1,25 @@
-"""API-key store: keys resolve to users, are stored only as hashes, and revoke."""
+"""API-key format. Storage and lookup moved to Postgres and are covered by the
+integration suite, which exercises them against a real database."""
 
-from graphrag.auth import KeyStore, generate_api_key, hash_key
+from graphrag.auth import generate_api_key, hash_key
 
 
-def test_key_roundtrip():
-    ks = KeyStore(None)  # in-memory
-    key = ks.create_key("alice")
+def test_keys_are_prefixed_and_long_enough_to_be_unguessable():
+    key = generate_api_key()
     assert key.startswith("grk_")
-    assert ks.resolve(key) == "alice"
-    assert ks.resolve("grk_bogus") is None
+    assert len(key) > 40
 
 
-def test_only_hash_is_stored():
-    ks = KeyStore(None)
-    key = ks.create_key("bob")
-    assert key not in ks._mem           # plaintext never stored
-    assert hash_key(key) in ks._mem     # only the hash
+def test_every_key_is_unique():
+    assert len({generate_api_key() for _ in range(100)}) == 100
 
 
-def test_hash_is_stable():
-    k = generate_api_key()
-    assert hash_key(k) == hash_key(k)
+def test_hashing_is_stable_and_one_way():
+    key = generate_api_key()
+    assert hash_key(key) == hash_key(key)
+    assert key not in hash_key(key)
+    assert len(hash_key(key)) == 64  # sha256 hex
 
 
-def test_revoke():
-    ks = KeyStore(None)
-    key = ks.create_key("carol")
-    assert ks.revoke_user("carol") == 1
-    assert ks.resolve(key) is None
+def test_different_keys_hash_differently():
+    assert hash_key(generate_api_key()) != hash_key(generate_api_key())
