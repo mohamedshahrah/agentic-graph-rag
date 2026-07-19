@@ -36,8 +36,10 @@ ENV PYTHONUNBUFFERED=1 \
     HF_HOME=/app/.cache/huggingface \
     GRAPHRAG_CONFIG_DIR=/app/configs
 
+# gosu lets the entrypoint drop from root to the app user cleanly (the pattern
+# the official Postgres image uses).
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      tesseract-ocr poppler-utils \
+      tesseract-ocr poppler-utils gosu \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /opt/venv /opt/venv
@@ -47,18 +49,24 @@ COPY pyproject.toml README.md alembic.ini ./
 COPY src ./src
 COPY configs ./configs
 COPY migrations ./migrations
+COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
 
-# Run as a non-root user. `data/` and the HF cache are the only paths written
-# at runtime, so they're the only ones that need to be owned.
+# Create the non-root user and own the image's paths. `data/` is owned at
+# runtime by the entrypoint, because it's a host bind mount whose ownership the
+# build can't set.
 RUN useradd --create-home --uid 1000 app \
     && mkdir -p /app/data /app/.cache/huggingface \
-    && chown -R app:app /app
-USER app
+    && chown -R app:app /app \
+    && chmod +x /usr/local/bin/entrypoint.sh
 
+# Stay root so the entrypoint can chown the mount; it drops to `app` before
+# exec'ing the server, so the actual process is unprivileged.
 EXPOSE 8000
 
 HEALTHCHECK --interval=10s --timeout=5s --retries=30 --start-period=60s \
   CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')" || exit 1
+
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
 
 # One worker process: the duckdb vector provider requires a single owner per
 # tenant file, and on 2 vCPUs a second worker would contend rather than help.

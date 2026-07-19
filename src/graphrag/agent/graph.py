@@ -14,17 +14,10 @@ from graphrag.agent.prompts import SYSTEM_PROMPT
 from graphrag.agent.styles import style_instruction
 from graphrag.agent.tools import ToolContext, build_tools
 from graphrag.core.logging import get_logger
+from graphrag.core.messages import content_to_text as _text
 from graphrag.core.types import QueryResult, RetrievedChunk
 
 log = get_logger(__name__)
-
-
-def _text(content) -> str:
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):  # Anthropic-style content blocks
-        return "".join(b.get("text", "") for b in content if isinstance(b, dict))
-    return str(content)
 
 
 def _postgres_checkpointer(dsn: str, use_async: bool):

@@ -1,0 +1,4 @@
+# Shell scripts and the entrypoint run inside Linux containers — a CRLF from a
+# Windows checkout breaks them with `\r`-not-found errors. Force LF.
+*.sh text eol=lf
+docker/entrypoint.sh text eol=lf

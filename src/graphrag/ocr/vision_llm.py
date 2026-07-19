@@ -1,6 +1,6 @@
 """Vision-LLM OCR. Default: Gemma 4 (small, local via Ollama). Swappable to
-Gemini 2.5 Flash by changing one config line. Both take an image + a
-'transcribe this' prompt through the same chat interface."""
+Gemini by changing one config line. Both take an image + a 'transcribe this'
+prompt through the same chat interface."""
 
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ import base64
 from langchain_core.messages import HumanMessage
 
 from graphrag.config.settings import OCRCfg, Secrets
+from graphrag.core.messages import content_to_text
 from graphrag.llm.factory import build_chat_model
 from graphrag.ocr.base import OCREngine
 
@@ -35,4 +36,4 @@ class VisionLLMOCR(OCREngine):
             ]
         )
         result = self._model.invoke([message])
-        return result.content if isinstance(result.content, str) else str(result.content)
+        return content_to_text(result.content)

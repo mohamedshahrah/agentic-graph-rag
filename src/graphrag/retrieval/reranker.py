@@ -15,6 +15,7 @@ from concurrent.futures import ThreadPoolExecutor
 from graphrag.config.settings import RerankCfg, Secrets
 from graphrag.core.errors import ConfigError, ProviderError
 from graphrag.core.logging import get_logger
+from graphrag.core.messages import content_to_text
 from graphrag.core.types import RetrievedChunk
 from graphrag.llm.factory import build_chat_model
 
@@ -94,11 +95,10 @@ class LLMReranker(Reranker):
         except Exception as exc:
             log.warning("rerank_call_failed", error=str(exc), model=self.cfg.model)
             return None
-        match = _SCORE_RE.search(str(reply.content))
+        content = content_to_text(reply.content)
+        match = _SCORE_RE.search(content)
         if match is None:
-            log.warning(
-                "rerank_unparseable", model=self.cfg.model, reply=str(reply.content)[:120]
-            )
+            log.warning("rerank_unparseable", model=self.cfg.model, reply=content[:120])
             return None
         return max(0.0, min(float(match.group()) / 10.0, 1.0))
 

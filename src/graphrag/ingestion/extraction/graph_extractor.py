@@ -11,6 +11,7 @@ from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from graphrag.core.logging import get_logger
+from graphrag.core.messages import content_to_text
 from graphrag.core.types import Entity, Relation
 
 log = get_logger(__name__)
@@ -77,8 +78,8 @@ class LLMGraphExtractor:
     def extract(self, text: str) -> tuple[list[Entity], list[Relation]]:
         messages = [SystemMessage(content=_SYSTEM), HumanMessage(content=text)]
         try:
-            raw = self._llm.invoke(messages).content
-            data = self._parse(raw if isinstance(raw, str) else str(raw))
+            raw = content_to_text(self._llm.invoke(messages).content)
+            data = self._parse(raw)
         except Exception as exc:
             log.warning("extraction_failed", error=str(exc))
             return [], []

@@ -19,6 +19,7 @@ import numpy as np
 
 from graphrag.config.settings import CommunityCfg, EntityResolutionCfg
 from graphrag.core.logging import get_logger
+from graphrag.core.messages import content_to_text
 from graphrag.embeddings.base import Embedder
 from graphrag.storage.graph.base import GraphStore
 
@@ -166,10 +167,7 @@ def build_communities(
             entities=", ".join(names[:40]), edges=edge_text or "none recorded"
         )
         try:
-            reply = llm.invoke(prompt)
-            summary = (
-                reply.content if isinstance(reply.content, str) else str(reply.content)
-            ).strip()
+            summary = content_to_text(llm.invoke(prompt).content).strip()
         except Exception as exc:
             log.warning("community_summary_failed", community=cid, error=str(exc))
             continue
