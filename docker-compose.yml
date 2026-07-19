@@ -1,15 +1,23 @@
 # One command brings up the whole system:  docker compose up -d
 #
 # Services:
-#   neo4j     graph + vector store        http://localhost:7474
-#   redis     memory / cache / queue
+#   neo4j     graph store                 http://localhost:7474
+#   postgres  accounts, limits, usage, chat history, agent memory
+#   redis     cache / rate-limit counters / job status
 #   api       FastAPI service             http://localhost:8000  (docs at /docs)
-#   worker    ingest queue worker (Arq)   — heavy work runs here, off the API
 #   frontend  React chat UI               http://localhost:5173
-#   ollama    local models (opt-in)       profile: local
+#   proxy     TLS termination             the public entrypoint (80/443)
+#   worker    ingest queue worker (Arq)   profile: worker  — see note below
+#   ollama    local models                profile: local
 #
-# RAM / CPU per service are capped via .env (see the *_MEM_LIMIT / *_CPU_LIMIT
-# knobs). Tune them for your machine. Fully local? add `--profile local`.
+# RAM / CPU per service are capped via .env (the *_MEM_LIMIT / *_CPU_LIMIT
+# knobs). The defaults target a 2 vCPU / 8 GB VPS and sum to ~4.7 GB of limits,
+# leaving room for the OS and page cache; raise them on a bigger box.
+#
+# Ingest runs inside the API by default. The separate `worker` profile exists
+# for deployments using the neo4j vector provider — it CANNOT be used with the
+# duckdb provider, which needs one process to own each tenant's database file
+# (the worker refuses to start in that combination rather than corrupting one).
 
 name: agentic-graph-rag
 
@@ -23,38 +31,62 @@ services:
       NEO4J_AUTH: neo4j/${GRAPHRAG_NEO4J_PASSWORD:-12345678}
       NEO4J_PLUGINS: '["apoc"]'
       NEO4J_dbms_security_procedures_unrestricted: apoc.*
-      # Bound Neo4j's memory so it can't starve the host.
-      NEO4J_server_memory_heap_max__size: ${NEO4J_HEAP:-1G}
-      NEO4J_server_memory_pagecache_size: ${NEO4J_PAGECACHE:-512M}
+      # Heap + pagecache must fit inside NEO4J_MEM_LIMIT with room for the JVM
+      # itself; 640m + 320m under a 1536m cap leaves ~570m of headroom.
+      NEO4J_server_memory_heap_max__size: ${NEO4J_HEAP:-640m}
+      NEO4J_server_memory_pagecache_size: ${NEO4J_PAGECACHE:-320M}
     ports: ["7474:7474", "7687:7687"]
     volumes: ["neo4j_data:/data"]
     deploy:
       resources:
-        limits: { cpus: "${NEO4J_CPU_LIMIT:-1.5}", memory: "${NEO4J_MEM_LIMIT:-2g}" }
+        limits: { cpus: "${NEO4J_CPU_LIMIT:-1}", memory: "${NEO4J_MEM_LIMIT:-1536m}" }
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://localhost:7474 || exit 1"]
       interval: 10s
       timeout: 5s
       retries: 20
 
-  redis:
-    # redis-stack-server, NOT plain redis: the LangGraph Redis checkpointer that
-    # backs durable agent memory needs the RediSearch/RedisJSON modules — it
-    # issues FT.* commands. Vanilla redis answers "unknown command 'FT._LIST'"
-    # and memory silently falls back to in-process. (This mismatch is also what
-    # writes an RDB a plain `redis:7-alpine` then can't reload — the modules'
-    # newer core bumps the RDB version.)
-    image: redis/redis-stack-server:7.4.0-v3
+  postgres:
+    image: postgres:16-alpine
     restart: unless-stopped
-    # maxmemory via REDIS_ARGS, not a `command:` override — overriding the
-    # command bypasses the entrypoint that loads the modules.
     environment:
-      REDIS_ARGS: "--maxmemory ${REDIS_MAXMEMORY:-384mb} --maxmemory-policy allkeys-lru"
-    ports: ["6379:6379"]
-    volumes: ["redis_data:/data"]
+      POSTGRES_USER: ${POSTGRES_USER:-graphrag}
+      POSTGRES_PASSWORD: ${GRAPHRAG_POSTGRES_PASSWORD:-change-me}
+      POSTGRES_DB: ${POSTGRES_DB:-graphrag}
+    # Sized for the 768m cap: shared_buffers is the classic 25%, and
+    # max_connections is deliberately small — the API pool (5+5) plus the
+    # checkpointer pool (4) plus headroom, not the default 100 idle backends.
+    command: >
+      postgres -c shared_buffers=192MB -c max_connections=40
+               -c work_mem=8MB -c maintenance_work_mem=64MB
+    ports: ["5432:5432"]
+    volumes: ["postgres_data:/var/lib/postgresql/data"]
     deploy:
       resources:
-        limits: { cpus: "${REDIS_CPU_LIMIT:-0.5}", memory: "${REDIS_MEM_LIMIT:-512m}" }
+        limits: { cpus: "${POSTGRES_CPU_LIMIT:-1}", memory: "${POSTGRES_MEM_LIMIT:-768m}" }
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-graphrag} -d ${POSTGRES_DB:-graphrag}"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
+  redis:
+    # Plain redis is enough now that durable agent memory lives in Postgres.
+    # (It was redis-stack only because the LangGraph Redis checkpointer issues
+    # FT.* commands that need the RediSearch modules.) Redis now holds caches,
+    # rate-limit windows and live job status — all rebuildable, hence the
+    # allkeys-lru eviction.
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: >
+      redis-server --maxmemory ${REDIS_MAXMEMORY:-192mb}
+                   --maxmemory-policy allkeys-lru --save ""
+    ports: ["6379:6379"]
+    # No volume: everything here is derived state. Dropping the old redis-stack
+    # volume also avoids an RDB the plain image cannot read.
+    deploy:
+      resources:
+        limits: { cpus: "${REDIS_CPU_LIMIT:-0.5}", memory: "${REDIS_MEM_LIMIT:-256m}" }
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 10s
@@ -66,9 +98,10 @@ services:
     restart: unless-stopped
     env_file: [.env]
     environment: &backend_env
-      GRAPHRAG_PROFILE: ${GRAPHRAG_PROFILE:-local}
+      GRAPHRAG_PROFILE: ${GRAPHRAG_PROFILE:-production}
       GRAPHRAG_NEO4J_URI: bolt://neo4j:7687
       GRAPHRAG_REDIS_URL: redis://redis:6379/0
+      GRAPHRAG_DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-graphrag}:${GRAPHRAG_POSTGRES_PASSWORD:-change-me}@postgres:5432/${POSTGRES_DB:-graphrag}
       # Defaults to the Ollama on the *host* (reusing models you've pulled).
       # Running the bundled service instead? set
       # GRAPHRAG_OLLAMA_BASE_URL_INTERNAL=http://ollama:11434 in .env.
@@ -84,10 +117,11 @@ services:
     depends_on:
       neo4j: { condition: service_healthy }
       redis: { condition: service_healthy }
+      postgres: { condition: service_healthy }
     volumes: ["./data:/app/data"]
     deploy:
       resources:
-        limits: { cpus: "${API_CPU_LIMIT:-2}", memory: "${API_MEM_LIMIT:-4g}" }
+        limits: { cpus: "${API_CPU_LIMIT:-2}", memory: "${API_MEM_LIMIT:-2g}" }
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
       interval: 10s
@@ -95,9 +129,13 @@ services:
       retries: 30
       start_period: 60s   # first boot may download local models
 
+  # Opt-in: `docker compose --profile worker up`. Requires
+  # GRAPHRAG_USE_WORKER=1 so the API dispatches to it, and a vector provider
+  # other than duckdb (the worker refuses to start otherwise).
   worker:
     build: { context: ., dockerfile: docker/Dockerfile }
     restart: unless-stopped
+    profiles: ["worker"]
     command: ["arq", "graphrag.worker.WorkerSettings"]
     env_file: [.env]
     environment:
@@ -116,10 +154,11 @@ services:
     depends_on:
       neo4j: { condition: service_healthy }
       redis: { condition: service_healthy }
+      postgres: { condition: service_healthy }
     volumes: ["./data:/app/data"]
     deploy:
       resources:
-        limits: { cpus: "${WORKER_CPU_LIMIT:-2}", memory: "${WORKER_MEM_LIMIT:-4g}" }
+        limits: { cpus: "${WORKER_CPU_LIMIT:-1}", memory: "${WORKER_MEM_LIMIT:-1g}" }
 
   frontend:
     build: { context: ./frontend }
@@ -129,7 +168,7 @@ services:
       api: { condition: service_healthy }
     deploy:
       resources:
-        limits: { cpus: "${FRONTEND_CPU_LIMIT:-0.5}", memory: "${FRONTEND_MEM_LIMIT:-128m}" }
+        limits: { cpus: "${FRONTEND_CPU_LIMIT:-0.5}", memory: "${FRONTEND_MEM_LIMIT:-64m}" }
 
   ollama:
     image: ollama/ollama:latest
@@ -164,7 +203,7 @@ services:
 
 volumes:
   neo4j_data:
-  redis_data:
+  postgres_data:
   ollama_data:
   caddy_data:
   caddy_config:

@@ -125,12 +125,31 @@ class Container:
 
     @cached_property
     def checkpointer(self):
+        return self._build_checkpointer(self.settings.agent.memory_backend)
+
+    def _build_checkpointer(self, backend: str, *, allow_redis: bool = True):
         return build_checkpointer(
-            self.secrets.redis_url,
+            self.secrets.redis_url if allow_redis else None,
             self.settings.agent.memory,
             use_async=self.async_memory,
             redis_available=self.redis is not None,
+            backend=backend,
+            database_url=self.secrets.database_url,
         )
+
+    def retry_checkpointer(self, failed_backend: str):
+        """Rebuild agent memory on a different backend after `failed_backend`
+        turned out to be unusable.
+
+        The async savers connect lazily, so a broken backend is only discovered
+        at setup time in the API lifespan — too late for `build_checkpointer`'s
+        own fallback chain. Plain Redis with the Redis saver is the case that
+        matters: it constructs happily and then fails every write.
+        """
+        other = "postgres" if failed_backend == "redis" else "redis"
+        saver = self._build_checkpointer(other, allow_redis=(other == "redis"))
+        self.__dict__["checkpointer"] = saver  # replace the cached_property
+        return saver
 
     # -- shared models (loaded once, reused by all tenants) -------------------
     @cached_property

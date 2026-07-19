@@ -27,49 +27,119 @@ def _text(content) -> str:
     return str(content)
 
 
+def _postgres_checkpointer(dsn: str, use_async: bool):
+    """Durable memory in Postgres — the same database that holds accounts and
+    chat history, which lets the deployment run plain Redis instead of
+    redis-stack (only the Redis saver needed the RediSearch modules).
+
+    The saver talks to psycopg directly, so it takes a libpq conninfo string,
+    not a SQLAlchemy URL (`libpq_dsn` strips the `+driver` marker psycopg
+    rejects). Connections are pooled and small: this pool shares Postgres'
+    `max_connections` budget with the app's SQLAlchemy engine.
+    """
+    from graphrag.db.engine import libpq_dsn
+
+    conninfo = libpq_dsn(dsn)
+    kwargs = {"autocommit": True, "prepare_threshold": 0}
+    if use_async:
+        from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+        from psycopg.rows import dict_row
+        from psycopg_pool import AsyncConnectionPool
+
+        # `open=False`: opening a pool binds it to the running loop, and the
+        # API's loop is not this one. The lifespan opens it and awaits setup().
+        pool = AsyncConnectionPool(
+            conninfo=conninfo, min_size=1, max_size=4, open=False,
+            kwargs={**kwargs, "row_factory": dict_row},
+        )
+        saver = AsyncPostgresSaver(pool)
+        saver._graphrag_pool = pool  # the lifespan opens/closes it
+        log.info("agent_memory", backend="postgres-async")
+        return saver
+
+    from langgraph.checkpoint.postgres import PostgresSaver
+    from psycopg.rows import dict_row
+    from psycopg_pool import ConnectionPool
+
+    pool = ConnectionPool(
+        conninfo=conninfo, min_size=1, max_size=2,
+        kwargs={**kwargs, "row_factory": dict_row},
+    )
+    saver = PostgresSaver(pool)
+    saver.setup()
+    log.info("agent_memory", backend="postgres")
+    return saver
+
+
+def _redis_checkpointer(redis_url: str, use_async: bool):
+    """Durable memory in Redis. Needs the RediSearch modules (redis-stack) —
+    plain Redis answers FT._LIST with "unknown command" and every checkpoint
+    write fails."""
+    if use_async:
+        from langgraph.checkpoint.redis import AsyncRedisSaver
+
+        # `asetup()` is awaited in the API lifespan, on the loop that serves
+        # requests — driving it here with asyncio.run() would bind the async
+        # client to a loop that closes on the way out.
+        saver = AsyncRedisSaver(redis_url=redis_url)
+        log.info("agent_memory", backend="redis-async")
+        return saver
+
+    from langgraph.checkpoint.redis import RedisSaver
+
+    saver = RedisSaver(redis_url=redis_url)
+    saver.setup()
+    log.info("agent_memory", backend="redis")
+    return saver
+
+
 def build_checkpointer(
     redis_url: str | None,
     enabled: bool,
     *,
     use_async: bool = False,
     redis_available: bool = True,
+    backend: str = "redis",
+    database_url: str | None = None,
 ):
-    """Durable agent memory in Redis when it is actually reachable; otherwise
-    in-process memory. Both Redis savers share one keyspace, so CLI (sync) and
-    API (async) see the same threads.
+    """Durable agent memory, falling back to in-process memory when no durable
+    backend is usable. CLI (sync) and API (async) share one keyspace, so a
+    thread started in one is visible to the other.
 
-    `use_async` picks the saver flavor. The API needs AsyncRedisSaver — its
-    /query streams over `astream`, which needs `aget_tuple`; the sync RedisSaver
+    The configured `backend` is tried first, then the other durable option.
+    Trying both matters because the two stores have opposite prerequisites: the
+    Redis saver needs redis-stack's RediSearch modules (plain Redis fails every
+    write), while the Postgres saver needs a database URL. A deployment that
+    runs plain Redis with Postgres available should get durable memory rather
+    than silently losing conversations to an in-process saver.
+
+    `use_async` picks the saver flavor. The API needs the async saver — its
+    /query streams over `astream`, which needs `aget_tuple`; the sync saver
     inherits a base that raises NotImplementedError there. The CLI is the mirror
     image: it calls the sync `invoke`, which the async saver refuses. Neither
     flavor covers both, hence the flag.
 
-    `redis_available` must be a real connectivity check. The savers connect
-    lazily, so constructing one against a dead Redis "succeeds" and then every
-    query fails at checkpoint time — with the check, an unreachable Redis
-    degrades to in-process memory instead.
+    Falling back rather than failing is deliberate: memory is a feature, not a
+    prerequisite. `redis_available` must be a real connectivity check, because
+    the savers connect lazily — constructing one against a dead Redis
+    "succeeds" and then every query fails at checkpoint time.
     """
     if not enabled:
         return None
-    if redis_url and redis_available:
+
+    candidates: list[str] = [backend] + [b for b in ("postgres", "redis") if b != backend]
+    for name in candidates:
         try:
-            if use_async:
-                from langgraph.checkpoint.redis import AsyncRedisSaver
+            if name == "postgres" and database_url:
+                return _postgres_checkpointer(database_url, use_async)
+            if name == "redis" and redis_url and redis_available:
+                return _redis_checkpointer(redis_url, use_async)
+        except Exception as exc:
+            # Postgres on Windows is usually the event loop: psycopg's async
+            # mode refuses the ProactorEventLoop asyncio defaults to there.
+            # Linux (and every container) uses a selector loop and is fine.
+            log.warning(f"{name}_checkpointer_unavailable", error=str(exc))
 
-                # `asetup()` is awaited in the API lifespan, on the loop that
-                # serves requests — driving it here with asyncio.run() would
-                # bind the async client to a loop that closes on the way out.
-                saver = AsyncRedisSaver(redis_url=redis_url)
-                log.info("agent_memory", backend="redis-async")
-                return saver
-            from langgraph.checkpoint.redis import RedisSaver
-
-            saver = RedisSaver(redis_url=redis_url)
-            saver.setup()
-            log.info("agent_memory", backend="redis")
-            return saver
-        except Exception as exc:  # package missing or incompatible -> fall back
-            log.warning("redis_checkpointer_unavailable", error=str(exc))
     from langgraph.checkpoint.memory import MemorySaver
 
     log.info("agent_memory", backend="in-process")

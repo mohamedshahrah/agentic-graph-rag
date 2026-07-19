@@ -46,9 +46,20 @@ async def ingest_task(ctx: dict, job_id: str, path: str, user_id: str | None) ->
 async def startup(ctx: dict) -> None:
     # Build the container once per worker so models load a single time.
     container = Container()
+    provider = container.settings.storage.vector.provider
+    if provider == "duckdb":
+        # DuckDB takes an exclusive file lock, so the API and this worker cannot
+        # both hold a tenant's database. Refuse at startup rather than fail
+        # every ingest with a confusing IO error at write time.
+        raise RuntimeError(
+            "The duckdb vector provider requires single-process ownership, so it "
+            "cannot run with a separate ingest worker. Either unset "
+            "GRAPHRAG_USE_WORKER (ingest runs inside the API), or switch "
+            "storage.vector.provider to neo4j."
+        )
     ctx["container"] = container
     ctx["jobs"] = JobStore(container.redis)
-    log.info("worker_started")
+    log.info("worker_started", vector_provider=provider)
 
 
 class WorkerSettings:

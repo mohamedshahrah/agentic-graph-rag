@@ -27,8 +27,11 @@ dependencies = [
   "slowapi>=0.1.9",          # request rate limiting
   "prometheus-client>=0.20", # /metrics
   # --- background jobs ---
-  "arq>=0.26",               # Redis-backed ingest queue (separate worker process)
-  "langgraph-checkpoint-redis>=0.0.3",  # durable agent memory
+  "arq>=0.26",               # Redis-backed ingest queue (opt-in worker process)
+  # Durable agent memory. Postgres is the production backend (it lets the
+  # deployment run plain redis); the Redis saver stays for local dev.
+  "langgraph-checkpoint-postgres>=3.1",
+  "langgraph-checkpoint-redis>=0.5",
   # --- agent / llm framework ---
   "langgraph>=1.2",
   "langchain-core>=0.3",
@@ -47,6 +50,15 @@ dependencies = [
   # --- storage & cache ---
   "neo4j>=5.23",
   "redis>=5.0",
+  "duckdb>=1.1",             # per-user vector store
+  # Accounts, limits, usage, chat history. psycopg is the checkpointer's driver;
+  # asyncpg is the app's. Both are needed, and they are not interchangeable.
+  "sqlalchemy[asyncio]>=2.0",
+  "asyncpg>=0.29",
+  "psycopg[binary,pool]>=3.2",
+  "alembic>=1.13",
+  "argon2-cffi>=23.1",       # password hashing
+  "httpx>=0.27",             # outbound calls (transactional email)
   # --- ingestion ---
   "pdfplumber>=0.11",
   "pillow>=10.4",

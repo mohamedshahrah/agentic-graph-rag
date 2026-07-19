@@ -1,13 +1,15 @@
 """Add documents to a user's knowledge base.
 
-Ingestion is queued to a background worker (Arq/Redis) so a large upload never
-blocks the request and the heavy work runs in a separately resource-limited
-container. If no queue is available, it falls back to an in-process task. Status
-is persisted in Redis and polled by job id. All ingestion is scoped to the
-current user (API key when auth is on, else the X-User-Id header)."""
+Ingestion runs as a background task so a large upload never blocks the request.
+Where it runs depends on deployment: with GRAPHRAG_USE_WORKER it goes to an Arq
+worker in a separately resource-limited container; otherwise it runs in-process,
+which is what the duckdb vector provider requires (one process must own each
+tenant's database file). Status is persisted in Redis and polled by job id. All
+ingestion is scoped to the current user."""
 
 from __future__ import annotations
 
+import asyncio
 import urllib.parse
 import urllib.request
 import uuid
@@ -47,8 +49,15 @@ _URL_SUFFIX = {
 }
 
 
+# Only one ingest at a time in-process. Extraction fires a burst of concurrent
+# LLM calls per document; two documents at once would double that against the
+# same two vCPUs the chat stream is using. Queued jobs simply wait, and the
+# client already polls for status.
+_INGEST_SLOT = asyncio.Semaphore(1)
+
+
 def _inproc_ingest(container: Container, store: JobStore, job_id: str, path: str, user_id) -> None:
-    """Fallback path when no queue worker is available."""
+    """Run the pipeline and record the outcome. Blocking — call it off the loop."""
     store.set(JobStatus(job_id, status="running"))
     try:
         stats = IngestPipeline(container).run(path, user_id=user_id)
@@ -61,6 +70,12 @@ def _inproc_ingest(container: Container, store: JobStore, job_id: str, path: str
         store.set(JobStatus(job_id, status="error", detail=str(exc)))
 
 
+async def _run_ingest(container: Container, store: JobStore, job_id: str, path: str, user_id):
+    """One queued ingest, off the event loop so streaming stays responsive."""
+    async with _INGEST_SLOT:
+        await asyncio.to_thread(_inproc_ingest, container, store, job_id, path, user_id)
+
+
 async def _enqueue(
     request: Request, background: BackgroundTasks, container: Container,
     store: JobStore, path: str, user_id,
@@ -70,8 +85,8 @@ async def _enqueue(
     arq = getattr(request.app.state, "arq", None)
     if arq is not None:
         await arq.enqueue_job("ingest_task", job_id, path, user_id)
-    else:  # no worker -> run in-process
-        background.add_task(_inproc_ingest, container, store, job_id, path, user_id)
+    else:  # no worker -> run in this process
+        background.add_task(_run_ingest, container, store, job_id, path, user_id)
     return IngestResponse(job_id=job_id, status="queued")
 
 

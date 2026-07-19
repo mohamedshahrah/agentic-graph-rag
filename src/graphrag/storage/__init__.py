@@ -33,6 +33,12 @@ def build_vector_store(
         from graphrag.storage.vector.local_store import LocalVectorStore
 
         return LocalVectorStore(cfg.local_dir, database, corpus, cfg.similarity)
+    if cfg.provider == "duckdb":
+        from graphrag.storage.vector.duckdb_store import DuckDBVectorStore
+
+        return DuckDBVectorStore(
+            cfg.duckdb_dir, database, corpus, cfg.similarity, cfg.memory_limit_mb
+        )
     raise ConfigError(f"Unknown vector provider: {cfg.provider}")
 
 
