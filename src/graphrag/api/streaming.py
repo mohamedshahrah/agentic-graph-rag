@@ -16,6 +16,18 @@ from graphrag.usage.recorder import TOKENS_OUT, record_usage
 log = get_logger(__name__)
 
 
+async def sse_refusal(message: str) -> AsyncIterator[dict]:
+    """A complete SSE response that only delivers a guardrails refusal.
+
+    Used when the input guard blocks a question before the agent ever runs: the
+    client still gets the same event shape (a `token`, empty `sources`, `done`)
+    plus a leading `safety` event marking why, so no model is called at all."""
+    yield {"event": "safety", "data": json.dumps({"action": "block", "stage": "input"})}
+    yield {"event": "token", "data": message}
+    yield {"event": "sources", "data": "[]"}
+    yield {"event": "done", "data": "[DONE]"}
+
+
 async def sse_answer(
     service: QueryService,
     question: str,
@@ -27,6 +39,7 @@ async def sse_answer(
     recorder=None,
     account_id: str | None = None,
     on_complete=None,
+    output_guard=None,
 ) -> AsyncIterator[dict]:
     sources = []
     started = time.perf_counter()
@@ -55,6 +68,29 @@ async def sse_answer(
             yield {"event": "token", "data": data}
         payload = [Source.from_chunk(c).model_dump() for c in sources]
         yield {"event": "sources", "data": json.dumps(payload)}
+
+        # Output guard (monitor mode on the stream): the tokens have already
+        # reached the client, so a streamed answer can't be rewritten or held
+        # back — instead we surface the verdict as a `safety` event the UI can
+        # act on. The non-streaming path enforces (block/redact) fully.
+        if output_guard is not None:
+            try:
+                verdict = await output_guard("".join(answer_parts), sources)
+            except Exception as exc:  # a safety add-on must never break the answer
+                log.warning("stream_output_guard_failed", error=str(exc) or type(exc).__name__)
+                verdict = None
+            if verdict is not None and (verdict.blocked or verdict.flagged or verdict.modified):
+                yield {
+                    "event": "safety",
+                    "data": json.dumps(
+                        {
+                            "action": verdict.action,
+                            "stage": "output",
+                            "reasons": verdict.reasons,
+                            "modified": verdict.modified,
+                        }
+                    ),
+                }
 
         record_usage(redis_client, user_id, tokens)
         if recorder is not None and account_id:

@@ -2,6 +2,8 @@
 
 Order (last wins):  configs/default.yaml  <  configs/<profile>.yaml  <  env vars
 The profile name comes from GRAPHRAG_PROFILE (default: "api").
+GRAPHRAG_LLM="provider:model" swaps just the reply LLM over whatever the
+profile chose — the one-line local <-> API toggle.
 """
 
 from __future__ import annotations
@@ -37,6 +39,35 @@ def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any
     return out
 
 
+# Providers build_chat_model knows how to construct (see graphrag/llm/factory.py).
+_LLM_PROVIDERS = {"ollama", "anthropic", "openai", "gemini", "deepseek", "qwen"}
+
+
+def _apply_llm_override(merged: dict[str, Any], override: str) -> None:
+    """Apply `GRAPHRAG_LLM=provider:model` on top of the merged YAML.
+
+    This is the single-change local <-> API toggle for the reply LLM. It swaps
+    only `llm.provider` / `llm.model`; embeddings, OCR and rerank stay on the
+    profile, so existing vectors remain valid. When the pair actually changes,
+    the profile's `extra` kwargs are cleared — they are model-specific (e.g.
+    Anthropic `thinking`, Ollama `num_ctx`) and would be rejected or wrong on
+    another provider's client.
+    """
+    provider, sep, model = override.partition(":")
+    provider = provider.strip().lower()
+    model = model.strip()
+    if not sep or not model or provider not in _LLM_PROVIDERS:
+        raise ConfigError(
+            "GRAPHRAG_LLM must be '<provider>:<model>' with provider one of "
+            f"{sorted(_LLM_PROVIDERS)}; got: {override!r}"
+        )
+    llm = merged.setdefault("llm", {})
+    if (llm.get("provider"), llm.get("model")) != (provider, model):
+        llm["provider"] = provider
+        llm["model"] = model
+        llm["extra"] = {}
+
+
 def _read_yaml(path: Path) -> dict[str, Any]:
     if not path.exists():
         raise ConfigError(f"Config file not found: {path}")
@@ -58,6 +89,9 @@ def load_settings(
     profile_path = cfg_dir / f"{profile}.yaml"
     if profile_path.exists():
         merged = _deep_merge(merged, _read_yaml(profile_path))
+
+    if secrets.llm_override:
+        _apply_llm_override(merged, secrets.llm_override)
 
     try:
         settings = Settings(**merged)

@@ -9,6 +9,9 @@ app:
   corpus: default
 
 # --- Reply LLM (the agent) ----------------------------------------------------
+# GRAPHRAG_LLM="provider:model" in the environment overrides provider/model
+# below (and clears `extra`) — the one-line local <-> API toggle. Embeddings,
+# OCR and rerank are NOT affected by it; they follow the profile.
 llm:
   # ollama | anthropic | openai | gemini | deepseek | qwen
   # deepseek and qwen are OpenAI-compatible endpoints (api.deepseek.com,
@@ -168,6 +171,29 @@ tenancy:
   per_tenant_database: false  # false: isolate by corpus (Community); true: DB per user (Enterprise)
   database_prefix: u_
   max_active_tenants: 256     # bound the per-user cache (heavy models stay shared)
+
+# --- Guardrails safety layer (integrated feature — integrations/guardrails) ---
+# Off by default: the base system is unchanged until you turn this on. When
+# enabled, every /query and /compare is screened by the standalone guardrails
+# service — the user's message before the model runs, the answer after (PII
+# redaction, groundedness, system-prompt leak). See docs/INTEGRATIONS.md.
+safety:
+  enabled: false
+  base_url: http://localhost:8080   # override per-env with GRAPHRAG_GUARDRAILS_URL
+  policy_id: default                # a policies/*.yaml id on the guardrails server
+  check_input: true                 # screen the user message before the model
+  check_output: true                # screen the answer (redact / block / groundedness)
+  fail_open: true                   # guard unreachable -> allow (true) or block (false)
+  timeout_s: 5.0
+
+# --- llmlens observability (integrated feature — integrations/llmlens) --------
+# Off by default. When enabled, the agent's LangChain/LangGraph runs are traced
+# to the standalone llmlens server: prompts, latency, tokens, cost-per-user,
+# tool calls, errors. url/key also read from LLMLENS_URL / LLMLENS_API_KEY.
+observability:
+  enabled: false
+  url: http://localhost:8100        # llmlens ingest API (remap off :8000 locally)
+  service: agentic-graph-rag
 
 # --- API ----------------------------------------------------------------------
 api:

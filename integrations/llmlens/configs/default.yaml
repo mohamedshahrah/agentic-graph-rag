@@ -1,0 +1,29 @@
+# Shared defaults. A profile (configs/<profile>.yaml) layers on top, then env
+# vars (connection strings, secrets) override both.
+# Connection details live in the environment (see .env.example), not here.
+
+app:
+  name: llmlens
+  log_level: INFO
+  retention_days: 30          # ClickHouse TTL on spans
+
+ingest:
+  queue_stream: llmlens:ingest   # Redis stream the API produces to
+  consumer_group: writers
+  batch_max_events: 1000         # worker flush size
+  batch_max_seconds: 2           # worker flush interval
+  record_content: true           # store prompt/response bodies (set false for strict privacy)
+
+alerting:
+  enabled: true
+  interval_seconds: 60           # how often the alert engine evaluates rules
+  default_cooldown_seconds: 900  # min gap between repeat firings of the same rule
+
+api:
+  cors_origins: ["http://localhost:5173"]
+  cors_methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
+  cors_headers: ["Content-Type", "Authorization", "X-Api-Key", "X-Admin-Key"]
+  rate_limit: "600/minute"       # ingest is bursty; keep this generous
+
+auth:
+  enabled: true                  # ingest requires a project secret key

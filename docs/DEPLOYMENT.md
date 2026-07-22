@@ -70,8 +70,10 @@ on. The API logs a warning at startup when auth is off; if you see
 certificate and redirects HTTP to HTTPS. Left at `:80`, everything is plaintext
 on the wire, including session cookies and passwords.
 
-For a real deployment also remove the host `ports:` from the `api` and
-`frontend` services in `docker-compose.yml`, so only the proxy is reachable.
+Every published port except the proxy's 80/443 is bound to `127.0.0.1`, so
+from the network only the proxy exists. Neo4j browser, Postgres, Redis, the
+raw API and the llmlens dashboard are reachable from the box itself (or over
+an SSH tunnel, e.g. `ssh -L 7474:localhost:7474 you@host`), never from outside.
 
 ## Email delivery (verification codes)
 

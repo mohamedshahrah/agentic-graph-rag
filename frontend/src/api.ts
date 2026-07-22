@@ -14,6 +14,12 @@ export interface Source {
   retriever: string;
 }
 
+export interface SafetyInfo {
+  action: string; // "block" | "flag" | "redacted"
+  stage: string; // "input" | "output"
+  reasons: string[];
+}
+
 export interface StoredFile {
   file_id: string;
   name: string;
@@ -161,6 +167,48 @@ async function jsonOrThrow<T>(res: Response): Promise<T> {
 // `reader.read()` awaiting forever — the caller never settles and the UI wedges
 // with its send button disabled, unrecoverable without a reload.
 const IDLE_TIMEOUT_MS = 60_000;
+
+export interface QueryResult {
+  answer: string;
+  sources: Source[];
+  safety: SafetyInfo | null;
+}
+
+// Non-streaming query. Used when the server must fully enforce the output guard
+// (block / redact) before the answer is shown — a streamed answer can't be pulled
+// back, so hard enforcement needs the whole answer in one response. Trades
+// token-by-token rendering for a firm safety guarantee plus a verdict to display.
+export async function queryOnce(
+  question: string,
+  style: string,
+  threadId: string,
+  model?: string,
+  signal?: AbortSignal,
+): Promise<QueryResult> {
+  const res = await fetch(`${API}/query`, {
+    method: "POST",
+    credentials: "include",
+    headers: headers({ "Content-Type": "application/json" }),
+    body: JSON.stringify({
+      question,
+      style,
+      thread_id: threadId,
+      stream: false,
+      ...(model ? { model } : {}),
+    }),
+    signal,
+  });
+  const data = await jsonOrThrow<{
+    answer: string;
+    sources: Source[];
+    safety: SafetyInfo | null;
+  }>(res);
+  return {
+    answer: data.answer,
+    sources: data.sources ?? [],
+    safety: data.safety ?? null,
+  };
+}
 
 export async function streamQuery(
   question: string,

@@ -228,6 +228,20 @@ class Container:
     def reranker(self):
         return build_reranker(self.settings.retrieval.rerank, self.secrets)
 
+    @cached_property
+    def guardrails(self):
+        """The Guardrails safety client, shared across tenants. Always built (so
+        the query path can call it unconditionally); its methods short-circuit
+        to `allow` when `safety.enabled` is false, and it opens no socket until
+        the first real check. The `GRAPHRAG_GUARDRAILS_URL` secret overrides the
+        YAML `base_url` so one image can point at a host or a compose service."""
+        from graphrag.safety import GuardrailsClient
+
+        cfg = self.settings.safety
+        if self.secrets.guardrails_url:
+            cfg = cfg.model_copy(update={"base_url": self.secrets.guardrails_url})
+        return GuardrailsClient(cfg, self.secrets.guardrails_api_key)
+
     # -- per-user tenants -----------------------------------------------------
     def _resolve_scope(self, user: str) -> tuple[str, str]:
         """Return (database, corpus) for a sanitized user id."""

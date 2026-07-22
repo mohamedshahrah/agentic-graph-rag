@@ -15,10 +15,11 @@ from graphrag.api.schemas import (
     CompareRequest,
     QueryRequest,
     QueryResponse,
+    SafetyInfo,
     Source,
     ToolCall,
 )
-from graphrag.api.streaming import sse_answer
+from graphrag.api.streaming import sse_answer, sse_refusal
 from graphrag.container import Container
 from graphrag.db.engine import session_scope
 from graphrag.db.models import Message, Thread
@@ -28,12 +29,43 @@ from graphrag.pipelines import QueryService
 
 router = APIRouter(tags=["query"])
 
+# Bound what the output guard sees: the groundedness check only needs the
+# retrieved evidence, and forwarding the whole corpus would be slow and could
+# trip the guard's own input-size caps.
+_MAX_GUARD_DOCS = 8
+_MAX_DOC_CHARS = 4000
 
-def _shape(result) -> QueryResponse:
+_REFUSAL = "I can't help with that request."
+
+
+def _context_docs(sources) -> list[dict[str, str]]:
+    """Retrieved chunks in the guard's `context_docs` shape (enables the
+    output-direction groundedness / hallucination check)."""
+    return [
+        {"id": c.chunk_id, "text": c.text[:_MAX_DOC_CHARS], "source": c.source}
+        for c in sources[:_MAX_GUARD_DOCS]
+    ]
+
+
+def _safety_info(verdict, stage: str) -> SafetyInfo | None:
+    """Surface a block/flag/redaction to the client; None when the guard allowed."""
+    if verdict.blocked:
+        action = "block"
+    elif verdict.modified:
+        action = "redacted"
+    elif verdict.flagged:
+        action = "flag"
+    else:
+        return None
+    return SafetyInfo(action=action, stage=stage, reasons=list(verdict.reasons))
+
+
+def _response(answer: str, sources, tool_calls, safety: SafetyInfo | None = None) -> QueryResponse:
     return QueryResponse(
-        answer=result.answer,
-        sources=[Source.from_chunk(c) for c in result.sources],
-        tool_calls=[ToolCall(**tc) for tc in result.tool_calls],
+        answer=answer,
+        sources=[Source.from_chunk(c) for c in sources],
+        tool_calls=[ToolCall(**tc) for tc in tool_calls],
+        safety=safety,
     )
 
 
@@ -119,13 +151,33 @@ async def query(
     model = container.chat_model(chosen.provider, chosen.model) if chosen else None
     model_name = chosen.model if chosen else container.settings.llm.model
 
+    guard = container.guardrails
+
+    # Guardrails input check — before the model runs. A block short-circuits the
+    # whole request: no agent, no retrieval, no tokens spent. No-op when
+    # safety.enabled is false (guard.check_input returns an `allow`).
+    if guard.enabled:
+        v_in = await guard.check_input(req.question)
+        if v_in.blocked:
+            refusal = v_in.refusal_message or _REFUSAL
+            await _save_turn(db, thread_id, req.question, refusal, [], model_name)
+            if stream:
+                return EventSourceResponse(sse_refusal(refusal))
+            return _response(refusal, [], [], _safety_info(v_in, "input"))
+
     if stream:
+        async def _out_guard(answer, sources):
+            return await guard.check_output(
+                req.question, answer, docs=_context_docs(sources)
+            )
+
         return EventSourceResponse(
             sse_answer(
                 service, req.question, req.style, req.thread_id, user.tenant_id,
                 redis_client=container.redis, model=model,
                 recorder=getattr(request.app.state, "usage", None),
                 account_id=user.user_id,
+                output_guard=_out_guard if guard.enabled else None,
                 on_complete=lambda answer, sources: _save_turn(
                     db, thread_id, req.question, answer, sources, model_name
                 ),
@@ -137,8 +189,24 @@ async def query(
         req.question, style=req.style, thread_id=req.thread_id,
         user_id=user.tenant_id, model=model,
     )
-    await _save_turn(db, thread_id, req.question, result.answer, result.sources, model_name)
-    return _shape(result)
+    answer, sources, tool_calls = result.answer, result.sources, result.tool_calls
+
+    # Guardrails output check — the non-streaming path can enforce fully: block
+    # (withhold the answer) or redact (swap in the sanitized, PII-clean text).
+    # The verdict rides back on the response so the UI can show why.
+    safety = None
+    if guard.enabled:
+        v_out = await guard.check_output(
+            req.question, answer, docs=_context_docs(sources)
+        )
+        if v_out.blocked:
+            answer, sources, tool_calls = (v_out.refusal_message or _REFUSAL), [], []
+        elif v_out.modified and v_out.sanitized_output is not None:
+            answer = v_out.sanitized_output
+        safety = _safety_info(v_out, "output")
+
+    await _save_turn(db, thread_id, req.question, answer, sources, model_name)
+    return _response(answer, sources, tool_calls, safety)
 
 
 @router.post("/compare", response_model=QueryResponse)
@@ -151,8 +219,30 @@ async def compare(
     subjects = ", ".join(req.subjects)
     aspects = ("along these aspects: " + ", ".join(req.aspects)) if req.aspects else ""
     question = f"Compare {subjects} {aspects}. Present the comparison as a table."
+
+    guard = container.guardrails
+    if guard.enabled:
+        # Screen the composed question: subjects AND aspects are user-supplied,
+        # and either one can carry an injection.
+        v_in = await guard.check_input(question)
+        if v_in.blocked:
+            return _response(
+                v_in.refusal_message or _REFUSAL, [], [], _safety_info(v_in, "input")
+            )
+
     result = await service.aanswer(
         question, style=req.style, thread_id=req.thread_id, user_id=user.tenant_id,
         model=_chat_model(container, req.model),
     )
-    return _shape(result)
+    answer, sources, tool_calls = result.answer, result.sources, result.tool_calls
+
+    safety = None
+    if guard.enabled:
+        v_out = await guard.check_output(question, answer, docs=_context_docs(sources))
+        if v_out.blocked:
+            answer, sources, tool_calls = (v_out.refusal_message or _REFUSAL), [], []
+        elif v_out.modified and v_out.sanitized_output is not None:
+            answer = v_out.sanitized_output
+        safety = _safety_info(v_out, "output")
+
+    return _response(answer, sources, tool_calls, safety)

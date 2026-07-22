@@ -1,0 +1,32 @@
+# docs_bot — the motivating case: a documentation assistant scoped to ONE product.
+# It inherits every default from the Policy model and only tightens off-topic handling
+# so out-of-scope requests (e.g. "build me a RAG system") get blocked, not answered.
+id: docs_bot
+description: AcmeDB SDK documentation assistant.
+
+scope:
+  app_description: >
+    A documentation assistant for the AcmeDB SDK. It answers questions strictly about
+    installing, configuring, and using the AcmeDB SDK and its API (queries, connections,
+    errors, migrations). It must NOT help build unrelated software, design new systems,
+    write general-purpose code, or discuss other products or vendors.
+  allowed_topics:
+    - AcmeDB SDK installation and setup
+    - AcmeDB API and query syntax
+    - AcmeDB configuration and connection options
+    - AcmeDB error messages and troubleshooting
+    - AcmeDB migrations and versioning
+  deny_topics:
+    - building other software or systems from scratch
+    - general system or architecture design
+    - unrelated programming help
+
+refusal_message: "I can only help with questions about the AcmeDB SDK documentation."
+fail_mode: flag
+
+checks:
+  input:
+    # Tighter than default so off-topic requests actually block.
+    off_topic: { enabled: true, flag_at: 0.4, block_at: 0.7 }
+  output:
+    off_topic: { enabled: true, flag_at: 0.4, block_at: 0.7 }

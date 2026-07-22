@@ -82,7 +82,13 @@ async def _csrf_guard(request: Request, call_next):
         origin = request.headers.get("Origin")
         if origin:
             allowed = request.app.state.container.settings.api.cors_origins
-            host = request.headers.get("Host", "")
+            # X-Forwarded-Host first so same-origin still resolves behind a proxy
+            # that rewrites Host to an internal name (nginx -> api:8000, a CDN,
+            # etc.). A cross-site request can set neither header without tripping
+            # a CORS preflight, so trusting them here is safe against the CSRF
+            # this guards — and it means the app works at localhost, a bare IP, or
+            # a domain with no per-environment config.
+            host = request.headers.get("X-Forwarded-Host") or request.headers.get("Host", "")
             same_host = origin.split("//")[-1] == host
             if not same_host and origin not in allowed and "*" not in allowed:
                 return JSONResponse(
@@ -287,6 +293,7 @@ async def _lifespan(app: FastAPI):
 
     yield
 
+    await container.guardrails.aclose()
     if app.state.arq is not None:
         await app.state.arq.close()
     if app.state.checkpoint_pool is not None:
@@ -308,6 +315,12 @@ def create_app(container: Container | None = None) -> FastAPI:
     # Must be set before anything touches `container.checkpointer`: the API
     # streams over `astream`, which needs the async saver flavor.
     container.async_memory = True
+
+    # llmlens observability. Registers a global LangChain handler, so it must run
+    # before the first agent is built; it's a no-op unless observability.enabled.
+    from graphrag.observability import setup_observability
+
+    setup_observability(container.settings, container.secrets)
 
     app = FastAPI(
         title="Agentic Graph RAG",

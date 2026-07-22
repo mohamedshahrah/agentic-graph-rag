@@ -9,6 +9,7 @@ from collections.abc import AsyncIterator
 from graphrag.agent import AgentSession
 from graphrag.container import Container
 from graphrag.core.types import QueryResult, RetrievedChunk
+from graphrag.observability import query_trace
 
 
 class QueryService:
@@ -53,7 +54,10 @@ class QueryService:
         model=None,
     ) -> QueryResult:
         """Async — the API's non-streaming path (async checkpointer)."""
-        return await self._session(question, style, thread_id, user_id, model).arun()
+        # The trace is a no-op unless llmlens observability is enabled; when it
+        # is, it roots the auto-traced LangChain spans under this user.
+        with query_trace("agent_query", user_id=user_id):
+            return await self._session(question, style, thread_id, user_id, model).arun()
 
     async def stream(
         self,
@@ -64,9 +68,10 @@ class QueryService:
         model=None,
     ) -> AsyncIterator[tuple[str, str, list[RetrievedChunk]]]:
         """Yield (kind, data, sources) — kind is "token" or "tool"."""
-        session = self._session(question, style, thread_id, user_id, model)
-        async for kind, data in session.astream_events():
-            yield kind, data, session.sources
+        with query_trace("agent_query", user_id=user_id):
+            session = self._session(question, style, thread_id, user_id, model)
+            async for kind, data in session.astream_events():
+                yield kind, data, session.sources
 
     def search(self, query: str, k: int = 8, user_id: str | None = None) -> list[RetrievedChunk]:
         return self._c.tenant(user_id).hybrid_retriever.retrieve(query, k)

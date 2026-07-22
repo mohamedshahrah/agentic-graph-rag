@@ -1,7 +1,7 @@
 import clsx from "clsx";
-import { Sparkles } from "lucide-react";
+import { ShieldAlert, Sparkles } from "lucide-react";
 
-import type { Source } from "../../api";
+import type { SafetyInfo, Source } from "../../api";
 import { Spinner } from "../ui";
 import { Markdown } from "./Markdown";
 import { Sources } from "./Sources";
@@ -12,6 +12,34 @@ export interface Turn {
   sources?: Source[];
   activity?: string;
   error?: string;
+  safety?: SafetyInfo;
+}
+
+// The safety verdict the guard returned for this answer, if it did more than
+// allow. Block reads as an error; flag/redacted as a softer warning.
+function SafetyBanner({ safety }: { safety: SafetyInfo }) {
+  const label =
+    safety.action === "block"
+      ? "Blocked by the safety check"
+      : safety.action === "redacted"
+        ? "Sensitive content was redacted by the safety check"
+        : "Flagged by the safety check";
+  return (
+    <div
+      className={clsx(
+        "mb-2 flex items-start gap-2 rounded-md px-3 py-2 text-[13px]",
+        safety.action === "block"
+          ? "bg-danger/10 text-danger"
+          : "bg-amber-500/10 text-amber-600 dark:text-amber-400",
+      )}
+    >
+      <ShieldAlert className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+      <span>
+        {label}
+        {safety.reasons.length > 0 && <> — {safety.reasons.join(", ")}</>}
+      </span>
+    </div>
+  );
 }
 
 // The agent's tool names are implementation detail; these are what the user
@@ -61,6 +89,8 @@ export function Message({ turn }: { turn: Turn }) {
             </span>
           </div>
         )}
+
+        {turn.safety && <SafetyBanner safety={turn.safety} />}
 
         {turn.content && <Markdown>{turn.content}</Markdown>}
 

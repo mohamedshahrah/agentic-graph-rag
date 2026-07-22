@@ -1,0 +1,27 @@
+# Reverse proxy + TLS. SITE_ADDRESS controls TLS:
+#   :80                   plain HTTP (default)
+#   localhost             HTTPS via Caddy's local CA
+#   llmlens.example.com   HTTPS via automatic Let's Encrypt
+#
+# NOTE: no global `email` option here — `email {$TLS_EMAIL}` with an empty env
+# var is a Caddyfile parse error and the proxy won't start. If you deploy with
+# a real domain and want an ACME account email, add at the top:
+#     { email you@example.com }
+
+{$SITE_ADDRESS::80} {
+	encode gzip
+
+	# API and OTLP keep their full path (routes are /api/* and /v1/*).
+	handle /api/* {
+		reverse_proxy api:8000 {
+			flush_interval -1
+		}
+	}
+	handle /v1/* {
+		reverse_proxy api:8000
+	}
+
+	handle {
+		reverse_proxy dashboard:80
+	}
+}

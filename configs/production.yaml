@@ -51,6 +51,15 @@ ingestion:
   # Ingest runs in-process on the API box; keep extraction from starving chat.
   max_concurrency: 2
 
+# --- Integrated features (see docs/INTEGRATIONS.md) ---------------------------
+# Both need their services up: `make deploy` (or the integrations overlay).
+# In-container URLs come from the compose overlay (guardrails:8080 /
+# llmlens-api:8000), so no base_url/url needs setting here.
+safety:
+  enabled: true             # screen every /query & /compare through guardrails
+observability:
+  enabled: true             # trace agent runs (tokens, cost, latency) to llmlens
+
 auth:
   enabled: true             # sessions or API keys required; X-User-Id ignored
   open_registration: true   # false -> only an admin can create accounts

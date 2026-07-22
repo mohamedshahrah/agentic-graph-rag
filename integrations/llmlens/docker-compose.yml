@@ -1,0 +1,140 @@
+# One command:  docker compose up -d
+#
+#   clickhouse  span storage (OLAP)          http://localhost:8123
+#   postgres    config/transactional store
+#   redis       ingest queue + cache
+#   api         ingest + query (FastAPI)     http://localhost:8000  (docs at /docs)
+#   worker      queue consumer + alert engine
+#   dashboard   React UI                     http://localhost:5173
+#   proxy       Caddy TLS reverse proxy      http://localhost:80 / 443
+
+name: llmlens
+
+services:
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.8
+    restart: unless-stopped
+    environment:
+      CLICKHOUSE_DB: ${LLMLENS_CLICKHOUSE_DB:-llmlens}
+      CLICKHOUSE_USER: ${LLMLENS_CLICKHOUSE_USER:-default}
+      CLICKHOUSE_PASSWORD: ${LLMLENS_CLICKHOUSE_PASSWORD:-}
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+    ports: ["8123:8123", "9000:9000"]
+    volumes: ["clickhouse_data:/var/lib/clickhouse"]
+    ulimits:
+      nofile: { soft: 262144, hard: 262144 }
+    deploy:
+      resources:
+        limits: { cpus: "${CLICKHOUSE_CPU_LIMIT:-2}", memory: "${CLICKHOUSE_MEM_LIMIT:-2g}" }
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8123/ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: llmlens
+      POSTGRES_PASSWORD: ${LLMLENS_POSTGRES_PASSWORD:-please-change-me}
+      POSTGRES_DB: llmlens
+    ports: ["5432:5432"]
+    volumes: ["postgres_data:/var/lib/postgresql/data"]
+    deploy:
+      resources:
+        limits: { cpus: "${POSTGRES_CPU_LIMIT:-1}", memory: "${POSTGRES_MEM_LIMIT:-512m}" }
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U llmlens"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--maxmemory", "${REDIS_MAXMEMORY:-256mb}", "--maxmemory-policy", "noeviction"]
+    ports: ["6379:6379"]
+    volumes: ["redis_data:/data"]
+    deploy:
+      resources:
+        limits: { cpus: "${REDIS_CPU_LIMIT:-0.5}", memory: "${REDIS_MEM_LIMIT:-384m}" }
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+
+  api:
+    build: { context: ., dockerfile: docker/Dockerfile.api }
+    restart: unless-stopped
+    env_file: [.env]
+    environment: &backend_env
+      LLMLENS_PROFILE: ${LLMLENS_PROFILE:-default}
+      LLMLENS_CLICKHOUSE_HOST: clickhouse
+      LLMLENS_POSTGRES_DSN: postgresql://llmlens:${LLMLENS_POSTGRES_PASSWORD:-please-change-me}@postgres:5432/llmlens
+      LLMLENS_REDIS_URL: redis://redis:6379/0
+    ports: ["8000:8000"]
+    depends_on:
+      clickhouse: { condition: service_healthy }
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    deploy:
+      resources:
+        limits: { cpus: "${API_CPU_LIMIT:-1}", memory: "${API_MEM_LIMIT:-1g}" }
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 40s
+
+  worker:
+    build: { context: ., dockerfile: docker/Dockerfile.api }
+    restart: unless-stopped
+    command: ["python", "-m", "llmlens_server.worker"]
+    env_file: [.env]
+    environment: *backend_env
+    # The image's healthcheck probes :8000, but the worker serves no HTTP.
+    healthcheck: { disable: true }
+    depends_on:
+      clickhouse: { condition: service_healthy }
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    deploy:
+      resources:
+        limits: { cpus: "${WORKER_CPU_LIMIT:-1}", memory: "${WORKER_MEM_LIMIT:-1g}" }
+
+  dashboard:
+    build: { context: ./dashboard }
+    restart: unless-stopped
+    ports: ["5173:80"]
+    depends_on:
+      api: { condition: service_healthy }
+    deploy:
+      resources:
+        limits: { cpus: "${DASHBOARD_CPU_LIMIT:-0.5}", memory: "${DASHBOARD_MEM_LIMIT:-128m}" }
+
+  proxy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    environment:
+      SITE_ADDRESS: ${SITE_ADDRESS:-:80}
+    ports: ["80:80", "443:443"]
+    volumes:
+      - ./docker/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      api: { condition: service_healthy }
+      dashboard: { condition: service_started }
+    deploy:
+      resources:
+        limits: { cpus: "${PROXY_CPU_LIMIT:-0.5}", memory: "${PROXY_MEM_LIMIT:-128m}" }
+
+volumes:
+  clickhouse_data:
+  postgres_data:
+  redis_data:
+  caddy_data:
+  caddy_config:

@@ -1,0 +1,6 @@
+# Local dev overrides. Auth off so you can POST traces without minting a key.
+auth:
+  enabled: false
+
+ingest:
+  record_content: true

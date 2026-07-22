@@ -4,7 +4,7 @@ import { useNavigate, useParams } from "react-router-dom";
 
 import {
   ApiError,
-  streamQuery,
+  queryOnce,
   threads as threadsApi,
   type LimitDetail,
   type ThreadInfo,
@@ -183,27 +183,17 @@ export default function Chat() {
       });
 
     try {
-      await streamQuery(
-        question,
-        style,
-        id,
-        (token) =>
-          setTurns((prev) => {
-            if (prev.length === 0) return prev;
-            const next = [...prev];
-            const last = next[next.length - 1];
-            next[next.length - 1] = {
-              ...last,
-              content: last.content + token,
-              activity: undefined,
-            };
-            return next;
-          }),
-        (sources) => patchLast({ sources }),
-        (tool) => patchLast({ activity: tool }),
-        model || undefined,
-        controller.signal,
-      );
+      // Non-streaming: the server runs the output guard and enforces (block /
+      // redact) before replying, then hands back the verdict to display. The
+      // answer arrives whole rather than token-by-token — the price of letting
+      // the guard hold an answer back instead of only flagging it after the fact.
+      const result = await queryOnce(question, style, id, model || undefined, controller.signal);
+      patchLast({
+        content: result.answer,
+        sources: result.sources,
+        safety: result.safety ?? undefined,
+        activity: undefined,
+      });
       // The title is set server-side from the first question; reflect it.
       void loadThreads();
     } catch (err) {

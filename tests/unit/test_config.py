@@ -1,7 +1,10 @@
 """Config loading and profile merge."""
 
+import pytest
+
 from graphrag.config import load_settings
 from graphrag.config.settings import Settings
+from graphrag.core.errors import ConfigError
 
 
 def test_default_profile_loads():
@@ -43,6 +46,36 @@ def test_enrichment_defaults():
     assert ing.resolve_entities.enabled is True
     assert ing.communities.enabled is True
     assert ing.communities.min_size >= 2
+
+
+def test_llm_env_toggle_swaps_only_the_llm(monkeypatch):
+    # GRAPHRAG_LLM is the one-change local <-> API switch: the reply LLM flips,
+    # embeddings stay on the profile (so the vector index stays valid), and the
+    # profile's model-specific `extra` kwargs (Anthropic thinking in api.yaml)
+    # must not leak onto the other provider's client.
+    monkeypatch.setenv("GRAPHRAG_LLM", "ollama:gemma4:e4b-it-q4_K_M")
+    settings, _ = load_settings(profile="api")
+    assert settings.llm.provider == "ollama"
+    assert settings.llm.model == "gemma4:e4b-it-q4_K_M"  # first-colon split
+    assert settings.llm.extra == {}
+    assert settings.embeddings.provider == "voyage"  # untouched
+
+
+def test_llm_env_toggle_matching_pair_keeps_extra(monkeypatch):
+    # Naming the pair the profile already uses is a no-op — tuned kwargs like
+    # num_ctx (local.yaml) survive.
+    monkeypatch.setenv("GRAPHRAG_LLM", "ollama:gemma4:e4b-it-q4_K_M")
+    settings, _ = load_settings(profile="local")
+    assert settings.llm.extra.get("num_ctx") == 8192
+
+
+def test_llm_env_toggle_rejects_garbage(monkeypatch):
+    monkeypatch.setenv("GRAPHRAG_LLM", "not-a-provider:whatever")
+    with pytest.raises(ConfigError):
+        load_settings(profile="api")
+    monkeypatch.setenv("GRAPHRAG_LLM", "gemini")  # no model
+    with pytest.raises(ConfigError):
+        load_settings(profile="api")
 
 
 def test_tenancy_defaults():

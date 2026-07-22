@@ -1,0 +1,27 @@
+# Shared image for the API and the worker (command differs in compose).
+FROM python:3.11-slim
+
+ENV PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1
+
+RUN apt-get update && apt-get install -y --no-install-recommends build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY README.md ./README.md
+COPY server/pyproject.toml ./server/pyproject.toml
+COPY server/src ./server/src
+RUN pip install ./server
+
+COPY configs ./configs
+# The package is installed into site-packages, so the loader can't find the
+# repo-relative configs/ — point it at the copy above explicitly.
+ENV LLMLENS_CONFIG_DIR=/app/configs
+
+EXPOSE 8000
+
+HEALTHCHECK --interval=10s --timeout=5s --retries=30 --start-period=40s \
+  CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')" || exit 1
+
+CMD ["uvicorn", "llmlens_server.api.app:create_app", "--factory", "--host", "0.0.0.0", "--port", "8000"]

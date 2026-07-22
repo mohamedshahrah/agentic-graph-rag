@@ -1,0 +1,16 @@
+"""Redis client factory (queue + cache + alert dedup state)."""
+
+from __future__ import annotations
+
+from functools import lru_cache
+
+from llmlens_server.core.errors import StorageError
+
+
+@lru_cache(maxsize=4)
+def get_redis(url: str):
+    try:
+        import redis
+    except ImportError as exc:  # pragma: no cover
+        raise StorageError("redis package not installed") from exc
+    return redis.Redis.from_url(url, decode_responses=True)

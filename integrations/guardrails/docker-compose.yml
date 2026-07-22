@@ -1,0 +1,42 @@
+# Guardrails server. By default it runs on the mock provider (offline, no keys).
+#
+#   docker compose up --build                       # mock judge
+#   docker compose --profile local-judge up --build # + a local Ollama judge (free, offline)
+#
+# For a hosted judge instead, set GUARD_LLM_PROVIDER / GUARD_LLM_MODEL / *_API_KEY in a .env
+# file (see .env.example) and drop the local-judge profile.
+services:
+  guardrails:
+    build: .
+    ports:
+      - "8080:8080"
+    # Lets the container reach services on the HOST (e.g. an Ollama you already run).
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      GUARD_LLM_PROVIDER: ${GUARD_LLM_PROVIDER:-mock}
+      GUARD_LLM_MODEL: ${GUARD_LLM_MODEL:-}
+      # For ollama/vllm: default to the Ollama running on YOUR machine (reuses models you
+      # already pulled). NOTE: inside a container, localhost is the container itself — so we
+      # target the host. For the local-judge sidecar below, override with
+      # GUARD_LLM_BASE_URL=http://ollama:11434/v1
+      GUARD_LLM_BASE_URL: ${GUARD_LLM_BASE_URL:-http://host.docker.internal:11434/v1}
+      GUARD_LLM_API_KEY: ${GUARD_LLM_API_KEY:-}
+      GUARD_API_KEY: ${GUARD_API_KEY:-}
+      # Local models can be slow to load — give the judge room (see .env).
+      GUARD_LLM_TIMEOUT_S: ${GUARD_LLM_TIMEOUT_S:-60}
+
+  # Optional local judge — only starts with:  --profile local-judge
+  ollama:
+    image: ollama/ollama:latest
+    profiles: ["local-judge"]
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama:/root/.ollama
+    # After it is up:  docker compose exec ollama ollama pull llama3.1
+    # then run guardrails with GUARD_LLM_PROVIDER=ollama, GUARD_LLM_MODEL=llama3.1,
+    # GUARD_LLM_BASE_URL=http://ollama:11434/v1  (service name, not localhost)
+
+volumes:
+  ollama:

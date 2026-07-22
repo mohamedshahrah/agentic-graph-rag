@@ -1,0 +1,235 @@
+# Unified integrations overlay — ONE compose project, ONE command.
+#
+# With the base file, this brings the two feature projects up alongside the RAG
+# stack in a single `docker compose` invocation (no second project, no second
+# `up`). It layers on top of docker-compose.yml:
+#
+#   Light — RAG + Guardrails safety (one small container):
+#     docker compose -f docker-compose.yml -f docker-compose.integrations.yml up -d
+#
+#   Full — also the llmlens observability platform (behind a profile, since it's
+#   a whole second stack: ClickHouse + Postgres + Redis + api + worker + UI):
+#     docker compose -f docker-compose.yml -f docker-compose.integrations.yml \
+#         --profile observability up -d
+#
+#   Or just:  make deploy      (runs the full command above)
+#
+# WHY THIS WORKS AS ONE PROJECT. llmlens's own containers resolve the service
+# names `api`, `redis`, `clickhouse` (its dashboard proxies to `api:8000`, its
+# API connects to `redis`/`clickhouse`) — names the RAG stack also uses. Compose
+# forbids duplicate *service* names, so the llmlens services are renamed
+# `llmlens-*` but given those plain names as **network aliases on an isolated
+# `llmlens` network**. Inside that network the llmlens containers still resolve
+# `api`/`redis`/... to each other; the RAG services never see them. `llmlens-api`
+# additionally joins a tiny `telemetry` network shared with the RAG API, which
+# reaches it as `http://llmlens-api:8000`. It must NOT join the default network:
+# there `redis` names the RAG cache, so a container on default + llmlens would
+# resolve that name to TWO different containers and Docker's DNS picks one
+# non-deterministically. The dedicated telemetry network keeps every lookup
+# unambiguous.
+#
+# DATASTORES: llmlens gets its own Redis (a durable noeviction queue — the RAG
+# Redis is an allkeys-lru cache, and one server can only have one eviction
+# policy) and ClickHouse (columnar span store). Postgres is NOT duplicated:
+# llmlens uses the RAG Postgres server with a separate `llmlens` database,
+# created on first deploy by the `llmlens-db-init` one-shot.
+#
+# The features stay OFF until enabled in configs/<profile>.yaml
+# (safety.enabled / observability.enabled) — see docs/INTEGRATIONS.md.
+
+services:
+  # ── Guardrails safety service (light; comes up with the overlay) ───────────
+  guardrails:
+    build: { context: ./integrations/guardrails }
+    restart: unless-stopped
+    environment:
+      GUARD_LLM_PROVIDER: ${GUARD_LLM_PROVIDER:-mock}   # offline default, no key
+      GUARD_LLM_MODEL: ${GUARD_LLM_MODEL:-}
+      GUARD_LLM_API_KEY: ${GUARD_LLM_API_KEY:-}
+      GUARD_LLM_BASE_URL: ${GUARD_LLM_BASE_URL:-http://host.docker.internal:11434/v1}
+      GUARD_LLM_TIMEOUT_S: ${GUARD_LLM_TIMEOUT_S:-60}
+      GUARD_API_KEY: ${GUARD_API_KEY:-}                 # match GRAPHRAG_GUARDRAILS_API_KEY
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    # Loopback only (debug); the API reaches it in-network as http://guardrails:8080
+    ports: ["127.0.0.1:8080:8080"]
+    deploy:
+      resources:
+        limits: { cpus: "${GUARDRAILS_CPU_LIMIT:-0.5}", memory: "${GUARDRAILS_MEM_LIMIT:-256m}" }
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
+  # ── llmlens observability platform (profile: observability) ────────────────
+  llmlens-clickhouse:
+    image: clickhouse/clickhouse-server:24.8
+    profiles: ["observability"]
+    restart: unless-stopped
+    environment:
+      CLICKHOUSE_DB: llmlens
+      CLICKHOUSE_USER: default
+      CLICKHOUSE_PASSWORD: ""
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+    volumes: ["llmlens_clickhouse_data:/var/lib/clickhouse"]
+    networks:
+      llmlens: { aliases: ["clickhouse"] }
+    ulimits:
+      nofile: { soft: 262144, hard: 262144 }
+    deploy:
+      resources:
+        limits: { cpus: "${LLMLENS_CLICKHOUSE_CPU_LIMIT:-2}", memory: "${LLMLENS_CLICKHOUSE_MEM_LIMIT:-2g}" }
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8123/ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
+  # No llmlens Postgres: llmlens shares the RAG Postgres *server* with its own
+  # `llmlens` database (its DSN is configurable, and one idle Postgres per
+  # feature is the kind of sprawl a small box can't afford). This one-shot
+  # creates that database if it's missing — needed because the server's volume
+  # may predate the overlay, so an image init script would never run.
+  llmlens-db-init:
+    image: postgres:16-alpine
+    profiles: ["observability"]
+    restart: "no"
+    environment:
+      PGHOST: postgres
+      PGUSER: ${POSTGRES_USER:-graphrag}
+      PGPASSWORD: ${GRAPHRAG_POSTGRES_PASSWORD:-change-me}
+    entrypoint: ["sh", "-ec"]
+    command:
+      - >
+        psql -d postgres -tAc "SELECT 1 FROM pg_database WHERE datname='llmlens'"
+        | grep -q 1 || createdb llmlens
+    networks: ["llmlens"]
+    depends_on:
+      postgres: { condition: service_healthy }
+
+  llmlens-redis:
+    image: redis:7-alpine
+    profiles: ["observability"]
+    restart: unless-stopped
+    # noeviction: this Redis is a durable ingest queue, not a cache — evicting
+    # stream entries under memory pressure would drop spans.
+    command: ["redis-server", "--maxmemory", "${LLMLENS_REDIS_MAXMEMORY:-256mb}", "--maxmemory-policy", "noeviction"]
+    volumes: ["llmlens_redis_data:/data"]
+    networks:
+      llmlens: { aliases: ["redis"] }
+    deploy:
+      resources:
+        limits: { cpus: "${LLMLENS_REDIS_CPU_LIMIT:-0.5}", memory: "${LLMLENS_REDIS_MEM_LIMIT:-384m}" }
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+
+  llmlens-api:
+    build: { context: ./integrations/llmlens, dockerfile: docker/Dockerfile.api }
+    profiles: ["observability"]
+    restart: unless-stopped
+    environment: &llmlens_env
+      # `local` = auth off, so the RAG API can post traces without a project key.
+      # For a locked-down deployment set LLMLENS_PROFILE=default and mint a key
+      # (`llmlens-server create-project`), then set LLMLENS_API_KEY on the api.
+      LLMLENS_PROFILE: ${LLMLENS_PROFILE:-local}
+      LLMLENS_CLICKHOUSE_HOST: clickhouse
+      # The shared RAG Postgres server (which joins the llmlens network below),
+      # separate `llmlens` database — created by llmlens-db-init.
+      LLMLENS_POSTGRES_DSN: postgresql://${POSTGRES_USER:-graphrag}:${GRAPHRAG_POSTGRES_PASSWORD:-change-me}@postgres:5432/llmlens
+      LLMLENS_REDIS_URL: redis://redis:6379/0
+      LLMLENS_ADMIN_KEY: ${LLMLENS_ADMIN_KEY:-change-me-admin}
+    networks:
+      llmlens: { aliases: ["api"] }   # what the dashboard/worker resolve
+      telemetry: {}                   # what the RAG API reaches as llmlens-api
+    # Loopback only: with LLMLENS_PROFILE=local auth is off, so this must not
+    # be reachable from the network. SSH-tunnel or front it for remote access.
+    ports: ["127.0.0.1:8100:8000"]
+    depends_on:
+      llmlens-clickhouse: { condition: service_healthy }
+      llmlens-db-init: { condition: service_completed_successfully }
+      llmlens-redis: { condition: service_healthy }
+    deploy:
+      resources:
+        limits: { cpus: "${LLMLENS_API_CPU_LIMIT:-1}", memory: "${LLMLENS_API_MEM_LIMIT:-1g}" }
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 40s
+
+  llmlens-worker:
+    build: { context: ./integrations/llmlens, dockerfile: docker/Dockerfile.api }
+    profiles: ["observability"]
+    restart: unless-stopped
+    command: ["python", "-m", "llmlens_server.worker"]
+    environment: *llmlens_env
+    networks: ["llmlens"]
+    depends_on:
+      llmlens-clickhouse: { condition: service_healthy }
+      llmlens-db-init: { condition: service_completed_successfully }
+      llmlens-redis: { condition: service_healthy }
+    healthcheck: { disable: true }   # no HTTP surface; the image's probe curls :8000
+    deploy:
+      resources:
+        limits: { cpus: "${LLMLENS_WORKER_CPU_LIMIT:-1}", memory: "${LLMLENS_WORKER_MEM_LIMIT:-1g}" }
+
+  llmlens-dashboard:
+    build: { context: ./integrations/llmlens/dashboard }
+    profiles: ["observability"]
+    restart: unless-stopped
+    networks: ["llmlens"]
+    # Loopback only: the dashboard shows every prompt and trace, and the local
+    # profile has no auth. SSH-tunnel (ssh -L 5273:localhost:5273) for remote.
+    ports: ["127.0.0.1:5273:80"]   # the llmlens UI (RAG frontend keeps :5173)
+    depends_on:
+      llmlens-api: { condition: service_healthy }
+    deploy:
+      resources:
+        limits: { cpus: "${LLMLENS_DASHBOARD_CPU_LIMIT:-0.5}", memory: "${LLMLENS_DASHBOARD_MEM_LIMIT:-128m}" }
+
+  # ── The shared Postgres also serves llmlens (separate database) ────────────
+  # Joining the llmlens network lets the llmlens containers resolve `postgres`
+  # — unambiguously, since this is now the only container answering that name.
+  postgres:
+    networks:
+      default: {}
+      llmlens: {}
+
+  # ── Point the RAG API at both features (merged onto the base api service) ───
+  api:
+    environment:
+      GRAPHRAG_GUARDRAILS_URL: ${GRAPHRAG_GUARDRAILS_URL:-http://guardrails:8080}
+      GRAPHRAG_GUARDRAILS_API_KEY: ${GRAPHRAG_GUARDRAILS_API_KEY:-}
+      LLMLENS_URL: ${LLMLENS_URL:-http://llmlens-api:8000}
+      LLMLENS_API_KEY: ${LLMLENS_API_KEY:-}
+    # default must be listed explicitly: declaring `networks` at all replaces
+    # the implicit default membership, and the RAG databases live there.
+    networks:
+      default: {}
+      telemetry: {}
+    # service_started (not _healthy): the guard client fails open, so a guard
+    # still booting must not hold the API back. llmlens is intentionally NOT a
+    # dependency — it's profile-gated and the tracer drops spans if it's absent.
+    depends_on:
+      guardrails: { condition: service_started }
+
+networks:
+  # Isolated network that lets the llmlens containers keep resolving the plain
+  # names they hardcode (api/postgres/redis/clickhouse) without colliding with
+  # the RAG services of the same role on the default network.
+  llmlens:
+    driver: bridge
+  # RAG api <-> llmlens-api only. A dedicated network (rather than putting
+  # llmlens-api on default) so no container ever sees two services answering
+  # to the same DNS name.
+  telemetry:
+    driver: bridge
+
+volumes:
+  llmlens_clickhouse_data:
+  llmlens_redis_data:

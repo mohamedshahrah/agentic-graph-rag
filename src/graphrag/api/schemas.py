@@ -38,10 +38,23 @@ class ToolCall(BaseModel):
     args: dict = {}
 
 
+class SafetyInfo(BaseModel):
+    """The guard's verdict, surfaced to the client when it did more than allow.
+
+    `action` is block | flag | redacted; `stage` is input | output. Present only
+    when the guard blocked, flagged, or redacted — a plain allow stays None.
+    """
+
+    action: str
+    stage: str
+    reasons: list[str] = []
+
+
 class QueryResponse(BaseModel):
     answer: str
     sources: list[Source] = []
     tool_calls: list[ToolCall] = []
+    safety: SafetyInfo | None = None
 
 
 class SearchRequest(BaseModel):

@@ -35,7 +35,10 @@ services:
       # itself; 640m + 320m under a 1536m cap leaves ~570m of headroom.
       NEO4J_server_memory_heap_max__size: ${NEO4J_HEAP:-640m}
       NEO4J_server_memory_pagecache_size: ${NEO4J_PAGECACHE:-320M}
-    ports: ["7474:7474", "7687:7687"]
+    # Loopback only — the API reaches Neo4j in-network as neo4j:7687. On a VPS
+    # a 0.0.0.0 bind would expose the database (with a guessable password) to
+    # the internet; use an SSH tunnel for the browser UI when remote.
+    ports: ["127.0.0.1:7474:7474", "127.0.0.1:7687:7687"]
     volumes: ["neo4j_data:/data"]
     deploy:
       resources:
@@ -56,10 +59,13 @@ services:
     # Sized for the 768m cap: shared_buffers is the classic 25%, and
     # max_connections is deliberately small — the API pool (5+5) plus the
     # checkpointer pool (4) plus headroom, not the default 100 idle backends.
+    # 64 (not 40) leaves room for the llmlens api/worker pools, which share
+    # this server (separate `llmlens` database) under the integrations overlay.
     command: >
-      postgres -c shared_buffers=192MB -c max_connections=40
+      postgres -c shared_buffers=192MB -c max_connections=64
                -c work_mem=8MB -c maintenance_work_mem=64MB
-    ports: ["5432:5432"]
+    # Loopback only — in-network clients use postgres:5432.
+    ports: ["127.0.0.1:5432:5432"]
     volumes: ["postgres_data:/var/lib/postgresql/data"]
     deploy:
       resources:
@@ -81,7 +87,9 @@ services:
     command: >
       redis-server --maxmemory ${REDIS_MAXMEMORY:-192mb}
                    --maxmemory-policy allkeys-lru --save ""
-    ports: ["6379:6379"]
+    # Loopback only — Redis has NO auth here; a 0.0.0.0:6379 bind on a public
+    # host is a well-known instant compromise. In-network clients use redis:6379.
+    ports: ["127.0.0.1:6379:6379"]
     # No volume: everything here is derived state. Dropping the old redis-stack
     # volume also avoids an RDB the plain image cannot read.
     deploy:
@@ -113,7 +121,9 @@ services:
       # On Linux, host.docker.internal doesn't exist unless mapped explicitly
       # (Docker Desktop provides it; plain dockerd does not).
       - "host.docker.internal:host-gateway"
-    ports: ["8000:8000"]
+    # Loopback only: handy for local /docs, invisible from the network. The
+    # public entrypoint is the proxy on 80/443.
+    ports: ["127.0.0.1:8000:8000"]
     depends_on:
       neo4j: { condition: service_healthy }
       redis: { condition: service_healthy }
@@ -163,7 +173,8 @@ services:
   frontend:
     build: { context: ./frontend }
     restart: unless-stopped
-    ports: ["5173:80"]
+    # Loopback only; from other devices use the proxy (80/443).
+    ports: ["127.0.0.1:5173:80"]
     depends_on:
       api: { condition: service_healthy }
     deploy:
@@ -174,15 +185,17 @@ services:
     image: ollama/ollama:latest
     restart: unless-stopped
     profiles: ["local"]
-    ports: ["11434:11434"]
+    # Loopback only — lets you `ollama pull` from the host; the API reaches it
+    # in-network (set GRAPHRAG_OLLAMA_BASE_URL_INTERNAL=http://ollama:11434).
+    ports: ["127.0.0.1:11434:11434"]
     volumes: ["ollama_data:/root/.ollama"]
     deploy:
       resources:
         limits: { cpus: "${OLLAMA_CPU_LIMIT:-4}", memory: "${OLLAMA_MEM_LIMIT:-8g}" }
 
-  # TLS termination + reverse proxy. This is the public entrypoint (80/443).
-  # For a real deployment, remove the host `ports` from api/frontend above so
-  # only the proxy is reachable from outside.
+  # TLS termination + reverse proxy. This is the public entrypoint (80/443) —
+  # every other published port above is bound to 127.0.0.1, so from the network
+  # only the proxy exists.
   proxy:
     image: caddy:2-alpine
     restart: unless-stopped

@@ -15,6 +15,28 @@ configs/default.yaml   <   configs/<profile>.yaml   <   environment (.env)
 Change the profile with `make setup PROFILE=local` (or `api`), or set
 `GRAPHRAG_PROFILE` directly.
 
+## The one-change LLM toggle
+
+`GRAPHRAG_LLM="<provider>:<model>"` in `.env` flips the **reply LLM only**,
+over whatever the profile chose:
+
+```bash
+GRAPHRAG_LLM=ollama:gemma4:e4b-it-q4_K_M   # local — no keys, no cloud
+GRAPHRAG_LLM=gemini:gemini-3.5-flash       # API — needs GOOGLE_API_KEY
+GRAPHRAG_LLM=anthropic:claude-opus-4-8     # API — needs ANTHROPIC_API_KEY
+```
+
+Then restart the API (`docker compose up -d api`, or restart uvicorn). The
+value splits on the *first* colon, so Ollama tags with colons work.
+
+Why this and not switching profiles: the profile also swaps the **embedding**
+provider, and vectors ingested under one embedder are unreadable under another
+(different spaces, often different dimensions) — a profile switch means
+re-ingesting everything. `GRAPHRAG_LLM` touches nothing but chat, so you can
+bounce between a local model and an API model against the same corpus.
+Embeddings, OCR and rerank stay on the profile; the profile's `llm.extra`
+kwargs are dropped when the pair changes (they're model-specific).
+
 ## Embeddings — the knobs
 
 The embedding block exposes fine-grained control:

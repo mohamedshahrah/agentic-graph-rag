@@ -75,6 +75,33 @@ For the full picture, see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
 ---
 
+## New: two features, built in — safety & observability
+
+This is the head of a three-project series, and the other two are now **wired
+into the RAG as optional features** while remaining their own standalone repos.
+Both are **off by default** and **fail-safe** — a stock run is unchanged, and
+neither can take the app down.
+
+| Feature | What it does here | Turn it on |
+| --- | --- | --- |
+| 🛡️ **Guardrails & Safety Layer** | Screens every question **before** the agent runs (prompt-injection / jailbreak / off-topic / pasted secrets → refuse without spending a token) and every answer **after** (PII & secret **redaction**, RAG **groundedness**, system-prompt **leak**). | `safety.enabled: true` |
+| 🔭 **llmlens observability** | Traces every agent run — prompts, latency, tokens, **cost per user**, tool calls, errors — to a self-hosted dashboard with alerting. One `instrument("langchain")` call captures the whole tool-using loop. | `observability.enabled: true` |
+
+The features live under [`integrations/`](integrations/) (vendored copies of
+their repos); the glue that connects them is in `src/graphrag/safety/` and
+`src/graphrag/observability/`. Both run in the **same compose project** as the
+RAG stack — one command brings up everything:
+
+```bash
+make deploy          # RAG + Guardrails + llmlens, one stack, one command
+# or lighter:
+make up-features     # RAG + Guardrails only (skips the heavier llmlens platform)
+```
+
+**How they're connected, end to end → [`docs/INTEGRATIONS.md`](docs/INTEGRATIONS.md).**
+
+---
+
 ## Quickstart
 
 ### Option A — one command (Docker)
@@ -122,6 +149,19 @@ users, limits, usage charts and per-tenant graph inspection.
 > development profiles: auth is **off**, and any caller can act as any user via
 > the `X-User-Id` header. Use `production` for anything reachable from a
 > network. The API logs a warning at startup when auth is disabled.
+
+**Switch the LLM between local and API with one line.** Set `GRAPHRAG_LLM` in
+`.env` and restart the API — only the chat model changes, so your ingested
+corpus keeps working (switching *profiles* also swaps the embedder, which
+means re-ingesting):
+
+```bash
+GRAPHRAG_LLM=ollama:gemma4:e4b-it-q4_K_M   # ← local
+GRAPHRAG_LLM=gemini:gemini-3.5-flash       # ← API
+docker compose up -d api                   # apply
+```
+
+See [`docs/CONFIGURATION.md`](docs/CONFIGURATION.md#the-one-change-llm-toggle).
 
 Ingest the sample corpus and ask a question:
 

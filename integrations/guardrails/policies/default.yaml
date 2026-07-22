@@ -1,0 +1,47 @@
+# Default policy — balanced, general-purpose safety layer.
+# Every key here is optional (the Policy model supplies these same defaults); this file
+# is shipped as living documentation of the full schema.
+id: default
+description: General-purpose safety layer with balanced thresholds.
+
+scope:
+  app_description: A general-purpose AI assistant.
+  allowed_topics: []
+  deny_topics: []
+
+refusal_message: "Sorry, I can't help with that request."
+fail_mode: flag        # open | closed | flag  (behaviour when the judge is unavailable)
+
+checks:
+  input:
+    prompt_injection: { enabled: true, flag_at: 0.6, block_at: 0.85, rule_action: block }
+    jailbreak:        { enabled: true, flag_at: 0.6, block_at: 0.85, rule_action: block }
+    off_topic:        { enabled: true, flag_at: 0.6, block_at: 1.1 }   # flag only by default
+    harmful_content:  { enabled: true, flag_at: 0.6, block_at: 0.85 }
+    secrets:          { enabled: true, block_at: 1.1, redact: true, redact_before_judge: true }
+    pii:              { enabled: true, block_at: 1.1, redact: true, redact_before_judge: false }
+    evasion:          { enabled: true, flag_at: 0.6, block_at: 1.1 }
+  output:
+    ungrounded:         { enabled: true, flag_at: 0.6, block_at: 0.9 }   # flag-first
+    harmful_content:    { enabled: true, flag_at: 0.6, block_at: 0.85 }
+    off_topic:          { enabled: true, flag_at: 0.6, block_at: 1.1 }
+    pii:                { enabled: true, block_at: 1.1, redact: true }
+    secrets:            { enabled: true, block_at: 1.1, redact: true, redact_before_judge: true }
+    system_prompt_leak: { enabled: true, block_at: 0.85, rule_action: block, min_overlap_chars: 40 }
+
+judge:
+  enabled: true
+  trigger: always              # always | on_rule_flag | never
+  include_context_turns: 6
+  max_context_doc_chars: 2000
+  max_total_doc_chars: 8000
+
+custom_rules: []
+
+limits:
+  max_input_chars: 20000
+  max_output_chars: 20000
+
+cache:
+  enabled: true
+  ttl_seconds: 300

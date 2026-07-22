@@ -246,6 +246,38 @@ class APICfg(BaseModel):
     max_files_per_user: int = 10       # cap uploaded files per user
 
 
+class SafetyCfg(BaseModel):
+    """The Guardrails integration — a safety verdict around every answer.
+
+    Off by default so the base system runs unchanged. When enabled, the query
+    path calls the standalone guardrails service (see integrations/guardrails)
+    before the model runs and after it answers. `base_url` is overridable with
+    GRAPHRAG_GUARDRAILS_URL; a server API key goes in GRAPHRAG_GUARDRAILS_API_KEY.
+    """
+
+    enabled: bool = False
+    base_url: str = "http://localhost:8080"
+    policy_id: str = "default"        # which policies/*.yaml the guard applies
+    check_input: bool = True          # screen the user message before the model
+    check_output: bool = True         # screen the answer (redaction, groundedness, leak)
+    # Guard unreachable/slow: fail_open=true keeps answering (allow), false refuses.
+    fail_open: bool = True
+    timeout_s: float = 5.0
+
+
+class ObservabilityCfg(BaseModel):
+    """The llmlens integration — trace every agent run to the llmlens server.
+
+    Off by default. When enabled, the LangChain SDK handler is registered at
+    startup so agent/LLM/tool spans, tokens, cost and latency ship to `url`
+    (override with LLMLENS_URL; project key in LLMLENS_API_KEY).
+    """
+
+    enabled: bool = False
+    url: str = "http://localhost:8100"   # llmlens ingest API (remapped off :8000)
+    service: str = "agentic-graph-rag"   # service name stamped on traces
+
+
 class Settings(BaseModel):
     """The fully-resolved, non-secret configuration."""
 
@@ -261,6 +293,9 @@ class Settings(BaseModel):
     tenancy: TenancyCfg = Field(default_factory=TenancyCfg)
     auth: AuthCfg = Field(default_factory=AuthCfg)
     api: APICfg = Field(default_factory=APICfg)
+    # --- integrated feature projects (both off by default) ---
+    safety: SafetyCfg = Field(default_factory=SafetyCfg)
+    observability: ObservabilityCfg = Field(default_factory=ObservabilityCfg)
 
 
 class Secrets(BaseSettings):
@@ -269,6 +304,15 @@ class Secrets(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore", populate_by_name=True)
 
     profile: str = Field(default="api", alias="GRAPHRAG_PROFILE")
+
+    # One-line local <-> API toggle for the reply LLM only: "provider:model",
+    # e.g. "ollama:gemma4:e4b-it-q4_K_M" or "gemini:gemini-3.5-flash" (split on
+    # the first colon, so Ollama tags with colons work). Overrides the profile's
+    # llm.provider/llm.model without touching embeddings/OCR/rerank — swapping
+    # those invalidates the vector index, which is exactly what a quick LLM
+    # switch must not do. Profile `extra` kwargs are dropped when the pair
+    # changes (they're model-specific, e.g. Anthropic thinking).
+    llm_override: str | None = Field(default=None, alias="GRAPHRAG_LLM")
 
     # Where the YAML profiles live. Only needed when the package is installed
     # away from the repo (the Docker image sets it to /app/configs); a source
@@ -291,6 +335,15 @@ class Secrets(BaseSettings):
     cohere_api_key: str | None = Field(default=None, alias="COHERE_API_KEY")
     deepseek_api_key: str | None = Field(default=None, alias="DEEPSEEK_API_KEY")
     dashscope_api_key: str | None = Field(default=None, alias="DASHSCOPE_API_KEY")
+
+    # --- integrated features: guardrails safety + llmlens observability ---
+    # URLs override the YAML base_url/url so the same image points at different
+    # services per environment (host vs. docker service names).
+    guardrails_url: str | None = Field(default=None, alias="GRAPHRAG_GUARDRAILS_URL")
+    guardrails_api_key: str | None = Field(default=None, alias="GRAPHRAG_GUARDRAILS_API_KEY")
+    # LLMLENS_* are the SDK's own env var names, reused here so one place sets them.
+    llmlens_url: str | None = Field(default=None, alias="LLMLENS_URL")
+    llmlens_api_key: str | None = Field(default=None, alias="LLMLENS_API_KEY")
 
     # --- accounts / email (used from Phase 2 on) ---
     database_url: str | None = Field(default=None, alias="GRAPHRAG_DATABASE_URL")

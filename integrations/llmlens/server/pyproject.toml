@@ -1,0 +1,60 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "llmlens-server"
+version = "0.1.0"
+description = "llmlens observability server: ingest, store (ClickHouse + Postgres), query, and alert on LLM traces."
+readme = "../README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+
+dependencies = [
+  # config & core
+  "pydantic>=2.7",
+  "pydantic-settings>=2.3",
+  "pyyaml>=6.0",
+  "structlog>=24.1",
+  "tenacity>=8.3",
+  "typer>=0.12",
+  # api
+  "fastapi>=0.111",
+  "uvicorn[standard]>=0.30",
+  "slowapi>=0.1.9",
+  "python-multipart>=0.0.9",
+  # storage & queue
+  "clickhouse-connect>=0.7",
+  "psycopg[binary]>=3.2",
+  "redis>=5.0",
+  # notifiers
+  "httpx>=0.27",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.2",
+  "pytest-asyncio>=0.23",
+  "ruff>=0.6",
+  "mypy>=1.11",
+  "types-PyYAML",
+]
+
+[project.scripts]
+llmlens-server = "llmlens_server.__main__:app"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/llmlens_server"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["src", "../tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "C4", "SIM"]
+ignore = ["B008"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src", "../sdk/src"]
+asyncio_mode = "auto"

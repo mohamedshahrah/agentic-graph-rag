@@ -3,6 +3,8 @@
 
 PROFILE ?= production
 COMPOSE := docker compose
+# The integrations overlay (Guardrails + llmlens) layered on the base stack.
+FEATURES := -f docker-compose.yml -f docker-compose.integrations.yml
 
 .DEFAULT_GOAL := help
 
@@ -43,6 +45,23 @@ up: ## One command: bring up the whole stack, then apply migrations
 	@echo "Frontend: http://localhost:5173"
 	@echo "Neo4j:    http://localhost:7474"
 
+up-features: ## RAG + Guardrails safety, one stack (no llmlens)
+	$(COMPOSE) $(FEATURES) up -d --build
+	$(COMPOSE) $(FEATURES) exec -T api alembic upgrade head
+	@echo "API:        http://localhost:8000/docs   Frontend: http://localhost:5173"
+	@echo "Guardrails: http://localhost:8080/health"
+
+deploy: ## Everything in ONE command: RAG + Guardrails + llmlens observability
+	$(COMPOSE) $(FEATURES) --profile observability up -d --build
+	$(COMPOSE) $(FEATURES) exec -T api alembic upgrade head
+	@echo "API:        http://localhost:8000/docs   Frontend: http://localhost:5173"
+	@echo "Guardrails: http://localhost:8080/health  (verdict service)"
+	@echo "llmlens UI: http://localhost:5273         (traces / cost / alerts)"
+	@echo "NOTE: enable the features in configs/$(PROFILE).yaml — safety.enabled / observability.enabled"
+
+deploy-down: ## Stop the full integrated stack (incl. llmlens)
+	$(COMPOSE) $(FEATURES) --profile observability down
+
 down: ## Stop the stack
 	$(COMPOSE) down
 
@@ -75,4 +94,5 @@ fmt: ## Auto-format & fix
 	ruff format src tests migrations
 
 .PHONY: help install setup migrate serve worker ingest admin up down logs \
+        up-features deploy deploy-down \
         test test-integration test-all eval frontend lint fmt

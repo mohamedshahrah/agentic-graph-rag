@@ -1,0 +1,30 @@
+# Build context for docker/Dockerfile (the API image). The image only needs
+# pyproject.toml, README.md, alembic.ini, src/, configs/, migrations/,
+# docker/entrypoint.sh and integrations/llmlens/sdk — everything below is
+# either huge (.venv, .git, node_modules), host-specific, or secret.
+.git
+.venv
+.env
+.env.*
+!.env.example
+data
+docs
+tests
+scripts
+frontend
+.pytest_cache
+.mypy_cache
+# The integrations have their own build contexts (compose points straight at
+# their directories, where this file does not apply). From the root context the
+# API image needs only the llmlens SDK — plus the llmlens README, which the
+# SDK's pyproject references as its readme (`../README.md`).
+integrations/guardrails
+integrations/llmlens/*
+!integrations/llmlens/sdk
+!integrations/llmlens/README.md
+# Cache excludes LAST: the latest matching pattern wins, so placed before the
+# `!` re-inclusions above these would lose — and the sdk's __pycache__ (host
+# CPython 3.14 .pyc files, useless to the 3.11 image) would ship anyway.
+**/__pycache__
+**/*.pyc
+**/.ruff_cache
