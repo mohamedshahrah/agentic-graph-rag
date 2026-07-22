@@ -19,7 +19,8 @@ from graphrag.api.schemas import (
     Source,
     ToolCall,
 )
-from graphrag.api.streaming import sse_answer, sse_refusal
+from graphrag.api.streaming import sse_answer, sse_message, sse_refusal
+from graphrag.agent.prompts import CLOSED_DOMAIN_REFUSAL
 from graphrag.container import Container
 from graphrag.db.engine import session_scope
 from graphrag.db.models import Message, Thread
@@ -165,6 +166,19 @@ async def query(
                 return EventSourceResponse(sse_refusal(refusal))
             return _response(refusal, [], [], _safety_info(v_in, "input"))
 
+    # Closed-domain gate: only answer when the knowledge base actually covers the
+    # question. One probe retrieval; if nothing clears retrieval.min_relevance, we
+    # refuse here — an off-topic question gets an honest "not in the KB" instead of
+    # a general-knowledge answer. min_relevance = 0 disables the gate.
+    min_rel = container.settings.retrieval.min_relevance
+    if min_rel > 0:
+        probe = service.search(req.question, user_id=user.tenant_id)
+        if not probe or probe[0].score < min_rel:
+            await _save_turn(db, thread_id, req.question, CLOSED_DOMAIN_REFUSAL, [], model_name)
+            if stream:
+                return EventSourceResponse(sse_message(CLOSED_DOMAIN_REFUSAL))
+            return _response(CLOSED_DOMAIN_REFUSAL, [], [])
+
     if stream:
         async def _out_guard(answer, sources):
             return await guard.check_output(
@@ -229,6 +243,12 @@ async def compare(
             return _response(
                 v_in.refusal_message or _REFUSAL, [], [], _safety_info(v_in, "input")
             )
+
+    min_rel = container.settings.retrieval.min_relevance
+    if min_rel > 0:
+        probe = service.search(question, user_id=user.tenant_id)
+        if not probe or probe[0].score < min_rel:
+            return _response(CLOSED_DOMAIN_REFUSAL, [], [])
 
     result = await service.aanswer(
         question, style=req.style, thread_id=req.thread_id, user_id=user.tenant_id,

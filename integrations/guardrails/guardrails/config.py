@@ -38,8 +38,8 @@ class Settings(BaseSettings):
     # The "which brain does the reasoning" knobs. Pick a preset with GUARD_LLM_PROVIDER,
     # name the model with GUARD_LLM_MODEL, and supply the key with GUARD_LLM_API_KEY
     # (or the preset's native key env var, e.g. ANTHROPIC_API_KEY / OPENAI_API_KEY).
-    llm_provider: str = "anthropic"
-    llm_model: str | None = None
+    llm_provider: str = "gemini"
+    llm_model: str | None = "gemini-2.5-flash-lite"
     llm_api_key: str | None = None
     llm_base_url: str | None = None
     llm_timeout_s: float = Field(default=10.0, gt=0)

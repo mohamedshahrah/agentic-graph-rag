@@ -16,6 +16,18 @@ from graphrag.usage.recorder import TOKENS_OUT, record_usage
 log = get_logger(__name__)
 
 
+async def sse_message(message: str) -> AsyncIterator[dict]:
+    """A complete SSE response that delivers one plain message and no sources.
+
+    Used by the closed-domain gate: the answer is a fixed refusal, so no model is
+    called — but the client still gets the token/sources/done shape it expects. No
+    `safety` event, because a "not in the knowledge base" refusal is a scope
+    decision, not a safety block."""
+    yield {"event": "token", "data": message}
+    yield {"event": "sources", "data": "[]"}
+    yield {"event": "done", "data": "[DONE]"}
+
+
 async def sse_refusal(message: str) -> AsyncIterator[dict]:
     """A complete SSE response that only delivers a guardrails refusal.
 

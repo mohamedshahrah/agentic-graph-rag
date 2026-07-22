@@ -33,8 +33,8 @@ class CheckConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     enabled: bool = True
-    flag_at: float = Field(default=0.6, ge=0.0, le=1.1)
-    block_at: float = Field(default=0.85, ge=0.0, le=1.1)  # 1.1 == never auto-block
+    flag_at: float = Field(default=0.8, ge=0.0, le=1.1)
+    block_at: float = Field(default=0.9, ge=0.0, le=1.1)  # 1.1 == never auto-block
     rule_action: RuleAction = "flag"
     redact: bool = False
     redact_before_judge: bool = False
@@ -62,7 +62,7 @@ class InputChecks(BaseModel):
 class OutputChecks(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    ungrounded: CheckConfig = Field(default_factory=lambda: _cfg(flag_at=0.6, block_at=0.9))
+    ungrounded: CheckConfig = Field(default_factory=lambda: _cfg(flag_at=0.8, block_at=0.9))
     harmful_content: CheckConfig = Field(default_factory=CheckConfig)
     off_topic: CheckConfig = Field(default_factory=lambda: _cfg(block_at=1.1))
     pii: CheckConfig = Field(default_factory=lambda: _cfg(redact=True, block_at=1.1))
@@ -70,7 +70,7 @@ class OutputChecks(BaseModel):
         default_factory=lambda: _cfg(redact=True, redact_before_judge=True, block_at=1.1)
     )
     system_prompt_leak: CheckConfig = Field(
-        default_factory=lambda: _cfg(rule_action="block", block_at=0.85)
+        default_factory=lambda: _cfg(rule_action="block", block_at=0.9)
     )
 
 

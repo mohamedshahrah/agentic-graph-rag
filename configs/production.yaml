@@ -36,6 +36,12 @@ retrieval:
   rerank:
     provider: cohere
     model: rerank-v4.0-fast
+  # Closed-domain gate: refuse questions the knowledge base doesn't cover instead
+  # of answering from the LLM's general knowledge. Calibrated on this corpus with
+  # Cohere rerank-v4: in-topic questions score 0.70–0.89, off-topic 0.11–0.20, so
+  # 0.5 cleanly rejects off-topic while leaving margin for oblique real questions.
+  # Lower it if legitimate questions get refused; raise it to be stricter.
+  min_relevance: 0.5
 
 storage:
   vector:

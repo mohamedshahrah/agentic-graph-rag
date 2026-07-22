@@ -77,19 +77,29 @@ For the full picture, see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
 ## New: two features, built in — safety & observability
 
-This is the head of a three-project series, and the other two are now **wired
-into the RAG as optional features** while remaining their own standalone repos.
-Both are **off by default** and **fail-safe** — a stock run is unchanged, and
-neither can take the app down.
+This is the head of a three-project series. Its two companions — linked in the
+table below — are **separate standalone projects of mine, merged into this repo as
+optional, off-by-default features** while each still lives and evolves in its own
+repository. Both are **fail-safe**: a stock run is unchanged, and neither can take
+the app down.
 
 | Feature | What it does here | Turn it on |
 | --- | --- | --- |
-| 🛡️ **Guardrails & Safety Layer** | Screens every question **before** the agent runs (prompt-injection / jailbreak / off-topic / pasted secrets → refuse without spending a token) and every answer **after** (PII & secret **redaction**, RAG **groundedness**, system-prompt **leak**). | `safety.enabled: true` |
-| 🔭 **llmlens observability** | Traces every agent run — prompts, latency, tokens, **cost per user**, tool calls, errors — to a self-hosted dashboard with alerting. One `instrument("langchain")` call captures the whole tool-using loop. | `observability.enabled: true` |
+| 🛡️ **[Guardrails & Safety Layer](https://github.com/mohamedshahrah/Guardrails-Safety-Layer-for-LLM-Apps)** | Screens every question **before** the agent runs (prompt-injection / jailbreak / off-topic / pasted secrets → refuse without spending a token) and every answer **after** (PII & secret **redaction**, RAG **groundedness**, system-prompt **leak**). | `safety.enabled: true` |
+| 🔭 **[llmlens observability](https://github.com/mohamedshahrah/LLMlens)** | Traces every agent run — prompts, latency, tokens, **cost per user**, tool calls, errors — to a self-hosted dashboard with alerting. One `instrument("langchain")` call captures the whole tool-using loop. | `observability.enabled: true` |
 
-The features live under [`integrations/`](integrations/) (vendored copies of
-their repos); the glue that connects them is in `src/graphrag/safety/` and
-`src/graphrag/observability/`. Both run in the **same compose project** as the
+The safety layer doesn't just observe — it **enforces and explains**. On the
+non-streaming answer path a `block` verdict withholds the answer and a redaction
+swaps in the PII-clean text *before* either reaches the browser, and the verdict
+rides back on the response so the UI shows the reader *why* an answer was blocked,
+flagged, or redacted. The judge behind it is any OpenAI-compatible model you point
+it at — `GUARD_LLM_PROVIDER` / `_MODEL` / `_BASE_URL` / `_API_KEY`, from a hosted
+Gemini/DeepSeek to a local Ollama, or `mock` for an offline, key-free run.
+
+What lives here under [`integrations/`](integrations/) is a **vendored copy of
+each repo linked above** — merged in so the whole system builds and ships as one
+project — and the glue that wires them into the RAG is in `src/graphrag/safety/`
+and `src/graphrag/observability/`. Both run in the **same compose project** as the
 RAG stack — one command brings up everything:
 
 ```bash
@@ -99,6 +109,52 @@ make up-features     # RAG + Guardrails only (skips the heavier llmlens platform
 ```
 
 **How they're connected, end to end → [`docs/INTEGRATIONS.md`](docs/INTEGRATIONS.md).**
+
+---
+
+## Grounded answering — it only speaks from your documents
+
+A RAG system's worst failure isn't a bad retrieval — it's a confident answer the
+documents never supported, with a citation bolted on for credibility. Ask a stock
+agent *"what's 55 × 88?"* or *"write me a web scraper"* and it will happily answer
+from its training data and cite your PDF anyway. This one is **closed-domain**: it
+answers from your corpus or it refuses — it never falls back on the model's
+general knowledge.
+
+Two layers enforce that, one deterministic and one in the prompt.
+
+**A relevance gate, before the model runs.** Every question is first probed
+against the knowledge base; if the best chunk's rerank score is below
+`retrieval.min_relevance`, the request is refused on the spot — no model call, no
+tokens spent, no fabricated citation. The threshold is a real number calibrated to
+your corpus, not a guess. Measured on a set of software-engineering notes with
+Cohere `rerank-v4`:
+
+| Question | Top score | |
+| --- | --- | --- |
+| "use case diagram and actors" — *in the docs* | 0.89 | ✅ answered |
+| "software requirements engineering" — *in the docs* | 0.70 | ✅ answered |
+| "write me a python web scraper" — *adjacent, not in the docs* | 0.49 | ⛔ refused |
+| "what is 55 × 88?" | 0.17 | ⛔ refused |
+| "weather forecast tomorrow" | 0.20 | ⛔ refused |
+
+In-topic questions cluster at 0.70–0.89 and off-topic at 0.11–0.20, so
+`min_relevance: 0.5` separates them with margin to spare. Raise it to be stricter,
+lower it if oblique-but-valid questions get turned away, or set `0` to disable the
+gate. It costs one extra retrieval per question and guards `/query` and `/compare`
+alike.
+
+**A strict closed-domain prompt, as the model's own rule.** The agent is told it
+has *no outside knowledge*: it must call a tool before answering, every claim must
+trace to a retrieved chunk it can cite, it may never invent a citation, and when
+the documents don't contain the answer it emits one fixed refusal instead of
+improvising. This catches the borderline cases the numeric gate lets through; the
+safety layer's **groundedness check** blocks an ungrounded answer as the final
+backstop.
+
+The net effect: a question your documents can answer comes back grounded and
+cited; anything else comes back as an honest *"I can't find that in the knowledge
+base"* — never a plausible invention.
 
 ---
 
@@ -583,6 +639,17 @@ This is built to run as a controllable service, not just a demo. What's in place
   also accepts an http(s) URL, fetched with a size cap. Uploads go through
   `/ingest/upload` regardless. Raising `max_upload_mb` also needs `MAX_UPLOAD_MB`
   in `.env` raised — nginx rejects oversized bodies before the API sees them.
+- **Grounded, closed-domain answers.** The assistant answers only from your
+  documents. A relevance gate (`retrieval.min_relevance`) refuses questions the
+  corpus doesn't cover before the model runs, a strict system prompt forbids
+  outside knowledge and fabricated citations, and the safety layer's groundedness
+  check blocks an ungrounded answer as a backstop — so *"what's 55 × 88?"* gets an
+  honest refusal, not a confident number with your PDF cited under it.
+- **Enforced safety verdicts.** With `safety.enabled`, the guard screens every
+  question before the agent and every answer after; on the non-streaming path a
+  block withholds the answer and a redaction swaps in the PII-clean text before
+  the browser sees it, with the verdict surfaced in the UI. The judge is any
+  OpenAI-compatible model (`GUARD_LLM_*`), or `mock` for an offline run.
 - **Prompt-injection hardening.** Retrieved documents are attacker-controlled, so
   everything a tool returns is sanitized (control characters, chat-template
   special tokens) and wrapped in `<untrusted_data>` markers the system prompt

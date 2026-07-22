@@ -144,6 +144,11 @@ class RetrievalCfg(BaseModel):
     candidate_k: int = 24
     graph_hops: int = 2
     rerank: RerankCfg = Field(default_factory=RerankCfg)
+    # Closed-domain gate. When > 0, a question whose best retrieved chunk scores
+    # below this is refused instead of answered — so the assistant only speaks
+    # from the knowledge base, never the LLM's general knowledge. The scale is the
+    # reranker's (Cohere rerank ≈ 0–1), so calibrate per corpus. 0 disables it.
+    min_relevance: float = 0.0
 
 
 class AgentCfg(BaseModel):
