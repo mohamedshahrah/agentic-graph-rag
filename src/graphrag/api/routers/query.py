@@ -10,6 +10,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy import select
 from sse_starlette.sse import EventSourceResponse
 
+from graphrag.agent.prompts import CLOSED_DOMAIN_REFUSAL
 from graphrag.api.deps import AuthUser, get_container, get_db, get_query_service
 from graphrag.api.schemas import (
     CompareRequest,
@@ -20,7 +21,6 @@ from graphrag.api.schemas import (
     ToolCall,
 )
 from graphrag.api.streaming import sse_answer, sse_message, sse_refusal
-from graphrag.agent.prompts import CLOSED_DOMAIN_REFUSAL
 from graphrag.container import Container
 from graphrag.db.engine import session_scope
 from graphrag.db.models import Message, Thread
