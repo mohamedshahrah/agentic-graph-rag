@@ -18,6 +18,14 @@ jobs:
       - name: Install
         run: pip install -e ".[dev]"
 
+      # The vendored llmlens observability SDK ships in the image by default
+      # (see docker/Dockerfile, WITH_LLMLENS=1) and is present in local dev, so
+      # the enabled-path observability test expects it. Install it here too;
+      # otherwise setup_observability takes the SDK-missing branch and the test
+      # for the instrumented path fails in CI only.
+      - name: Install observability SDK
+        run: pip install -e integrations/llmlens/sdk
+
       - name: Lint
         run: ruff check src tests migrations
 
